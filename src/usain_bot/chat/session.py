@@ -1,0 +1,132 @@
+"""Provider-agnostic tool-calling loop. Builds the message list, calls
+whichever LLMProvider is configured, executes any tool calls against
+CoachService, feeds results back, and repeats until the model produces
+a final text answer. Persists only the user message and final assistant
+reply to the conversations store — not the intermediate tool-call
+scaffolding, which isn't meaningful dialogue history.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from ..models import ConversationEntry
+from ..service import CoachService
+from .providers.base import (
+    ChatMessage,
+    LLMProvider,
+    LLMProviderError,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from .tools import TOOL_SPECS, execute_tool
+
+MAX_TOOL_ITERATIONS = 6
+
+SYSTEM_PROMPT = """You are an evidence-based endurance running coach with an injury-first \
+mandate, talking with an adult runner returning to volume with a history of hip labral \
+repair (lead hip) and a recent lumbar strain.
+
+Core principles, in priority order:
+1. Injury prevention outranks plan adherence. A missed week is recoverable; an injury is not.
+2. Reason from actual data, never from the plan on paper — the plan is a hypothesis, the \
+athlete's real training history is the evidence.
+3. When signals conflict, the more conservative recommendation always wins. No exceptions \
+without an explicit, informed override from the athlete.
+4. Consistency beats heroics.
+5. Explain your reasoning: name the binding constraint and what would change it.
+
+You have tools that read the athlete's actual data and apply plan changes through the same \
+deterministic guardrail math the rest of the system uses. You must never compute or invent a \
+mileage figure, date, or guardrail value yourself — always call the relevant tool and report \
+what it returns. If no tool can answer a question, say so plainly rather than guessing.
+
+If the athlete mentions any physical symptom (hip, back, soreness, fatigue), call \
+set_health_flag proactively rather than waiting to be asked. If you're about to recommend or \
+discuss an increase in volume or intensity, call get_today_recommendation or get_plan_overview \
+first to ground it in the actual current guardrail state — don't assume from earlier in the \
+conversation, since the athlete may have logged a new run since.
+
+Keep replies concise and scannable — this is a chat UI, not a report."""
+
+
+@dataclass
+class ChatTurnResult:
+    reply: str
+    tool_calls: list[str]
+
+
+def _normalize_history(past: list[ConversationEntry]) -> list[ChatMessage]:
+    """The conversations store is shared with the CLI (overrides, per-run
+    logging), so consecutive entries aren't guaranteed to alternate
+    user/assistant the way a chat API requires. Merge consecutive
+    same-role entries and drop any leading assistant turn so the first
+    message is always from the user."""
+    merged: list[ChatMessage] = []
+    for entry in past:
+        role = "user" if entry.role == "user" else "assistant"
+        if merged and merged[-1].role == role:
+            prior_text = merged[-1].content[0].text  # type: ignore[union-attr]
+            merged[-1] = ChatMessage(role=role, content=[TextBlock(text=prior_text + "\n" + entry.text)])
+        else:
+            merged.append(ChatMessage(role=role, content=[TextBlock(text=entry.text)]))
+    while merged and merged[0].role != "user":
+        merged.pop(0)
+    return merged
+
+
+def run_chat_turn(
+    provider: LLMProvider,
+    service: CoachService,
+    user_message: str,
+    history_limit: int = 20,
+) -> ChatTurnResult:
+    past = service.storage.get_conversation_history(limit=history_limit)
+    messages: list[ChatMessage] = _normalize_history(past)
+    if messages and messages[-1].role == "user":
+        # Would violate strict alternation once we append the new user
+        # turn below; fold it in instead of sending two user messages back to back.
+        prior_text = messages[-1].content[0].text  # type: ignore[union-attr]
+        messages[-1] = ChatMessage(role="user", content=[TextBlock(text=prior_text)])
+        messages.append(ChatMessage(role="assistant", content=[TextBlock(text="(acknowledged)")]))
+    messages.append(ChatMessage(role="user", content=[TextBlock(text=user_message)]))
+
+    service.storage.save_conversation_entry(ConversationEntry(
+        timestamp=datetime.utcnow(), role="user", text=user_message,
+    ))
+
+    tool_calls: list[str] = []
+    final_text = ""
+
+    for _ in range(MAX_TOOL_ITERATIONS):
+        try:
+            response = provider.run_turn(SYSTEM_PROMPT, messages, TOOL_SPECS)
+        except LLMProviderError as exc:
+            final_text = f"Chat is unavailable right now: {exc}"
+            break
+
+        messages.append(ChatMessage(role="assistant", content=response.content))
+
+        text_parts = [b.text for b in response.content if isinstance(b, TextBlock)]
+        tool_uses = [b for b in response.content if isinstance(b, ToolUseBlock)]
+
+        if response.stop_reason != "tool_use" or not tool_uses:
+            final_text = "\n".join(text_parts).strip() or "(no reply)"
+            break
+
+        result_blocks = []
+        for call in tool_uses:
+            tool_calls.append(call.name)
+            result = execute_tool(call.name, call.input, service)
+            result_blocks.append(ToolResultBlock(tool_use_id=call.id, content=result))
+        messages.append(ChatMessage(role="user", content=result_blocks))
+    else:
+        final_text = "I made a lot of tool calls without reaching an answer — try rephrasing or asking something narrower."
+
+    service.storage.save_conversation_entry(ConversationEntry(
+        timestamp=datetime.utcnow(), role="agent", text=final_text,
+        metadata={"tool_calls": tool_calls},
+    ))
+    return ChatTurnResult(reply=final_text, tool_calls=tool_calls)

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>usain-bot</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">🏃</span>
+    <span class="brand-name">usain-bot</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="chat" role="tab" aria-selected="true">Chat</button>
+    <button class="tab" data-tab="upcoming" role="tab" aria-selected="false">Upcoming</button>
+    <button class="tab" data-tab="history" role="tab" aria-selected="false">History</button>
+  </nav>
+  <div class="status-pill" id="status-pill">…</div>
+</header>
+
+<main>
+  <section id="panel-chat" class="panel active">
+    <div class="chat-shell">
+      <div class="chat-log" id="chat-log">
+        <div class="msg agent">
+          <div class="bubble">Hi — ask me anything about today's run, the plan, or your history. I only ever answer using your real data and the same guardrails the CLI uses.</div>
+        </div>
+      </div>
+      <div class="quick-actions" id="quick-actions">
+        <button data-quick="What should I run today?">What should I run today?</button>
+        <button data-quick="Show me the rest of the plan">Show me the plan</button>
+        <button data-quick="Make next week easier">Make next week easier</button>
+        <button data-quick="My hip is bothering me">My hip is bothering me</button>
+      </div>
+      <form id="chat-form" class="chat-input-row">
+        <input id="chat-input" type="text" placeholder="Ask usain-bot…" autocomplete="off" />
+        <button type="submit" id="chat-send">Send</button>
+      </form>
+      <p class="chat-note" id="chat-note"></p>
+    </div>
+  </section>
+
+  <section id="panel-upcoming" class="panel">
+    <div class="grid">
+      <div class="card" id="today-card">
+        <div class="card-header">
+          <h2>Today's recommendation</h2>
+          <div class="header-actions">
+            <button id="flag-hip" class="flag-btn" title="Hip flag">Hip</button>
+            <button id="flag-back" class="flag-btn" title="Back flag">Back</button>
+            <button id="flag-fatigue" class="flag-btn" title="Fatigue flag">Fatigue</button>
+            <button id="refresh-today" class="ghost-btn">Refresh</button>
+          </div>
+        </div>
+        <div id="today-body" class="loading">Loading…</div>
+      </div>
+
+      <div class="card">
+        <h2>Next 7 days</h2>
+        <div id="next7-body" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <h2>Rolling plan</h2>
+        <div id="plan-body" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <div class="card-header">
+          <h2>Plan history</h2>
+          <span class="hint-text">Every version, why it changed, and which weeks moved</span>
+        </div>
+        <div id="plan-history-body" class="loading">Loading…</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-history" class="panel">
+    <div class="grid">
+      <div class="card wide">
+        <div class="card-header">
+          <h2>Weekly volume</h2>
+          <div class="header-actions">
+            <select id="history-window">
+              <option value="30">30 days</option>
+              <option value="90" selected>90 days</option>
+              <option value="180">180 days</option>
+              <option value="365">365 days</option>
+            </select>
+            <button id="sync-now" class="ghost-btn">Sync Garmin</button>
+          </div>
+        </div>
+        <div id="history-chart" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <h2>Past runs</h2>
+        <div id="history-table" class="loading">Loading…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+# usain-bot configuration.
+# Everything here is a starting hypothesis, not ground truth — the agent
+# re-derives anchors (volume, long-run capacity, ACWR) from actual Garmin
+# history on every invocation and will say so explicitly if this config
+# disagrees with reality.
+
+athlete:
+  baseline_long_run_mi: 8.0        # as of late July 2026 — verified against Garmin on first run
+  injury_history:
+    - hip_labral_repair_lead_hip   # ongoing recovery, load-sensitive
+    - lumbar_strain                # from barbell landmine rows
+  available_run_days_per_week: 3   # confirmed with athlete 2026-07-24
+  cross_training: [cycling, strength]
+
+goals:
+  - name: half_marathon_benchmark
+    distance_mi: 13.1
+    type: milestone                # distance capability, not a race
+    target_weeks_from_baseline: 8
+  - name: marathon
+    distance_mi: 26.2
+    type: race
+    date: "2027-02-07"             # confirmed with athlete 2026-07-24
+  - name: ultra_50k
+    distance_mi: 31.1
+    type: race
+    date: null                     # scheduled after marathon recovery, once readiness confirmed
+
+sequencing:
+  post_marathon_recovery_weeks: 3  # reverse taper, non-negotiable
+  ultra_specific_block_weeks: 10   # begins after recovery block
+
+guardrails:
+  backoff_cadence: 3               # N build weeks : 1 back-off week (3:1 default, hip history)
+  long_run_pct_of_weekly_volume: 0.35
+  long_run_pct_of_weekly_volume_ultra_block: 0.40
+  weekly_volume_growth_factor: 1.10
+  long_run_increment_pct: 0.10
+  long_run_increment_abs_cap_mi: 1.0
+  acwr_green_max: 1.3
+  acwr_yellow_max: 1.5
+  acwr_detrain_min: 0.8
+
+storage:
+  backend: local                   # "local" | "gcp" (gcp is stubbed, see storage/gcp.py)
+  local:
+    data_dir: ./data
+    db_filename: usain_bot.db
+    references_dir: references
+
+chat:
+  provider: anthropic              # only provider implemented today — see chat/providers/
+  model: claude-sonnet-5
+  max_tokens: 1536
