@@ -342,6 +342,11 @@ def run_invocation(
     if health_flag:
         storage.save_health_flag(HealthFlag(timestamp=datetime.utcnow(), flag=health_flag))
 
+    # Every saved version gets a diff recorded, not just conversational
+    # overrides — otherwise the plan_versions lineage is dominated by
+    # daily reprojections with no record of what actually changed.
+    plan.diff_from_prior = diff_plan_versions(prior_plan, plan)
+
     recommendation = compute_recommendation(config, storage, classified, anchors, plan, as_of, health_flag)
     _log_decision(recommendation)
 
@@ -395,6 +400,7 @@ def first_run_report(config: Config, storage: StorageBackend, adapter: GarminAda
         config, anchors, as_of, version=1, trigger="first_run",
         rationale="Initial macro plan generated from 12 weeks of Garmin history on first invocation.",
     )
+    plan.diff_from_prior = diff_plan_versions(None, plan)
 
     uncertainties = [
         "Injury flare risk is inferred only from pace/HR/volume signals in Garmin data — it has no "

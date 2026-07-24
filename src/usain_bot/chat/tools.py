@@ -34,6 +34,13 @@ def tool_get_plan_overview(service: CoachService, input: dict) -> dict:
     return service.get_plan_payload()
 
 
+def tool_get_plan_history(service: CoachService, input: dict) -> dict:
+    payload = service.get_plan_history_payload()
+    limit = int(input.get("limit", 10))
+    payload["versions"] = payload["versions"][:max(1, min(limit, 50))]
+    return payload
+
+
 def tool_get_run_history(service: CoachService, input: dict) -> dict:
     days = int(input.get("days", 90))
     days = max(7, min(days, 365))
@@ -149,6 +156,20 @@ TOOL_SPECS: list[ToolSpec] = [
         input_schema={"type": "object", "properties": {}},
     ),
     ToolSpec(
+        name="get_plan_history",
+        description=(
+            "Get the version history of the plan itself: every past change (daily reprojections, "
+            "gap-protocol adjustments, overrides), when it happened, why (trigger + rationale), and "
+            "which weeks actually changed vs. the version before it. Use this for any question about "
+            "how or why the plan has changed, e.g. 'why is my long run different from last week' or "
+            "'what changed after I asked to ease up'."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max versions to return, newest first, default 10, max 50"}},
+        },
+    ),
+    ToolSpec(
         name="get_run_history",
         description="Get the athlete's classified run history (long/easy/quality/recovery/cross-training) over a trailing window, with per-run detail and aggregate counts/mileage.",
         input_schema={
@@ -221,6 +242,7 @@ TOOL_SPECS: list[ToolSpec] = [
 _DISPATCH: dict[str, Callable[[CoachService, dict], dict]] = {
     "get_today_recommendation": tool_get_today_recommendation,
     "get_plan_overview": tool_get_plan_overview,
+    "get_plan_history": tool_get_plan_history,
     "get_run_history": tool_get_run_history,
     "ease_upcoming_week": tool_ease_upcoming_week,
     "shift_marathon_date": tool_shift_marathon_date,

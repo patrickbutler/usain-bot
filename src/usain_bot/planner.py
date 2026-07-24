@@ -235,29 +235,86 @@ def _current_block_label(long_run_mi: float, milestone_hit: bool) -> str:
     return "marathon_block"
 
 
+_DIFF_COMPARE_TOLERANCE_MI = 0.1
+
+
+@dataclass(frozen=True)
+class WeekDiff:
+    """One week's before/after across two plan versions. `old`/`new` are
+    None for added/removed weeks. This is the structured form the web
+    UI renders as a table; `diff_plan_versions` below is a text renderer
+    over the same data, kept for the CLI/plan-version rationale field."""
+
+    week_number: int
+    change_type: str  # "added" | "removed" | "changed" | "unchanged"
+    old: Optional[PlanWeek]
+    new: Optional[PlanWeek]
+    changed_fields: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "week_number": self.week_number,
+            "change_type": self.change_type,
+            "old": self.old.to_dict() if self.old else None,
+            "new": self.new.to_dict() if self.new else None,
+            "changed_fields": list(self.changed_fields),
+        }
+
+
+def diff_plan_weeks(old: Optional[PlanVersion], new: PlanVersion) -> list[WeekDiff]:
+    """Structured per-week lineage between two plan versions. `old=None`
+    (first-ever plan) reports every week as added."""
+    if old is None:
+        return [WeekDiff(w.week_number, "added", None, w) for w in new.weeks]
+
+    old_by_week = {w.week_number: w for w in old.weeks}
+    new_by_week = {w.week_number: w for w in new.weeks}
+    diffs: list[WeekDiff] = []
+    for wn in sorted(set(old_by_week) | set(new_by_week)):
+        ow, nw = old_by_week.get(wn), new_by_week.get(wn)
+        if ow is None:
+            diffs.append(WeekDiff(wn, "added", None, nw))
+            continue
+        if nw is None:
+            diffs.append(WeekDiff(wn, "removed", ow, None))
+            continue
+
+        changed_fields = []
+        if abs(ow.target_volume_mi - nw.target_volume_mi) >= _DIFF_COMPARE_TOLERANCE_MI:
+            changed_fields.append("target_volume_mi")
+        if abs(ow.long_run_mi - nw.long_run_mi) >= _DIFF_COMPARE_TOLERANCE_MI:
+            changed_fields.append("long_run_mi")
+        if ow.block != nw.block:
+            changed_fields.append("block")
+        if ow.is_backoff != nw.is_backoff:
+            changed_fields.append("is_backoff")
+
+        diffs.append(WeekDiff(
+            wn, "changed" if changed_fields else "unchanged", ow, nw, tuple(changed_fields),
+        ))
+    return diffs
+
+
 def diff_plan_versions(old: Optional[PlanVersion], new: PlanVersion) -> str:
     if old is None:
         return f"Initial plan (v{new.version}): {len(new.weeks)} weeks generated."
 
     lines = [f"Plan v{old.version} -> v{new.version}:"]
-    old_by_week = {w.week_number: w for w in old.weeks}
-    new_by_week = {w.week_number: w for w in new.weeks}
-    all_weeks = sorted(set(old_by_week) | set(new_by_week))
     changed = 0
-    for wn in all_weeks:
-        ow, nw = old_by_week.get(wn), new_by_week.get(wn)
-        if ow is None:
-            lines.append(f"  + week {wn}: added ({nw.block}, {nw.target_volume_mi:.1f} mi / LR {nw.long_run_mi:.1f} mi)")
-            changed += 1
-        elif nw is None:
-            lines.append(f"  - week {wn}: removed (was {ow.block})")
-            changed += 1
-        elif (round(ow.target_volume_mi, 1) != round(nw.target_volume_mi, 1)
-              or round(ow.long_run_mi, 1) != round(nw.long_run_mi, 1)
-              or ow.block != nw.block):
+    for d in diff_plan_weeks(old, new):
+        if d.change_type == "added":
             lines.append(
-                f"  ~ week {wn}: {ow.block}/{ow.target_volume_mi:.1f}mi/LR{ow.long_run_mi:.1f} "
-                f"-> {nw.block}/{nw.target_volume_mi:.1f}mi/LR{nw.long_run_mi:.1f}"
+                f"  + week {d.week_number}: added ({d.new.block}, {d.new.target_volume_mi:.1f} mi / "
+                f"LR {d.new.long_run_mi:.1f} mi)"
+            )
+            changed += 1
+        elif d.change_type == "removed":
+            lines.append(f"  - week {d.week_number}: removed (was {d.old.block})")
+            changed += 1
+        elif d.change_type == "changed":
+            lines.append(
+                f"  ~ week {d.week_number}: {d.old.block}/{d.old.target_volume_mi:.1f}mi/LR{d.old.long_run_mi:.1f} "
+                f"-> {d.new.block}/{d.new.target_volume_mi:.1f}mi/LR{d.new.long_run_mi:.1f}"
             )
             changed += 1
     if changed == 0:

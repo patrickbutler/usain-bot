@@ -143,7 +143,7 @@ usain-bot serve
 Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, built entirely on the same `agent`/`planner`/`storage` functions as the CLI — it's a view onto the same system, not a second implementation:
 
 - **Chat** — ask about today's run, the plan, or your history in plain English; apply overrides ("make next week easier," "shift the marathon back two weeks") and mention symptoms ("my hip's been sore") conversationally.
-- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, and the full plan week by week, with one-click hip/back/fatigue flags and a refresh button.
+- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override), expandable to see exactly which weeks changed and how.
 - **History** — a weekly volume chart and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
 
 Chat needs `ANTHROPIC_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
@@ -171,6 +171,32 @@ branch regardless of what the guardrail math would otherwise allow: cap
 at the last completed distance, no quality work, cross-training
 suggested instead. Flags are persisted so the agent can see the pattern
 over time (`storage.get_recent_health_flags()`).
+
+## Plan version history
+
+Every plan change — a daily reprojection from `usain-bot run`, a gap-protocol
+adjustment, a regeneration after a long layoff, or a conversational
+override — writes a brand-new, immutable `PlanVersion` row; nothing is
+ever mutated in place. Every version records:
+
+- **trigger** — what caused it (`first_run`, `scheduled_reprojection`, `gap_detected`, `gap_regeneration`, `user_override`)
+- **rationale** — the human-readable "why," including any cited reference article
+- **diff_from_prior** — a text diff against the immediately preceding version
+- a **structured per-week diff** (`planner.diff_plan_weeks`), computed on the fly from the stored weeks — which weeks were added/removed/changed and exactly which fields moved (volume, long run, block, back-off status)
+
+```bash
+usain-bot plan --history          # CLI: full lineage with diffs
+```
+
+```
+GET /api/plan/history             # REST: same data, JSON, newest first
+```
+
+The web UI's Upcoming tab renders this as an expandable list; the chat's
+`get_plan_history` tool lets you ask "why did my plan change" or "what
+happened after I asked to ease up" directly. See the design notes below
+for the current limit of this system: overrides show up as their own
+version but don't survive the *next* natural reprojection.
 
 ## Storage backend
 
@@ -201,7 +227,7 @@ No changes are needed anywhere else — `agent.py`, `planner.py`, and
 pytest
 ```
 
-130+ tests, all network-free — including chat, which is tested against a
+146+ tests, all network-free — including chat, which is tested against a
 scripted fake `LLMProvider` (`tests/test_chat_session.py`), never the
 real Anthropic API. `guardrails.py` functions are pure and unit-tested
 directly, including edge cases (zero chronic load, a >6-week gap, a long

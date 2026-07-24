@@ -74,15 +74,7 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
 
     @app.get("/api/plan/history")
     def get_plan_history():
-        return {
-            "versions": [
-                {
-                    "version": pv.version, "created_at": pv.created_at.isoformat(),
-                    "trigger": pv.trigger, "rationale": pv.rationale, "diff_from_prior": pv.diff_from_prior,
-                }
-                for pv in service.get_plan_history()
-            ]
-        }
+        return service.get_plan_history_payload()
 
     @app.get("/api/history")
     def get_history(days: int = 90):

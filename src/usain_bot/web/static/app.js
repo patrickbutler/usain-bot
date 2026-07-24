@@ -183,11 +183,72 @@
     `;
   }
 
+  function fieldLabel(field) {
+    return { target_volume_mi: "volume", long_run_mi: "long run", block: "block", is_backoff: "back-off" }[field] || field;
+  }
+
+  function formatWeekValue(field, week) {
+    if (!week) return "";
+    if (field === "target_volume_mi") return `${week.target_volume_mi.toFixed(1)} mi`;
+    if (field === "long_run_mi") return `${week.long_run_mi.toFixed(1)} mi`;
+    if (field === "block") return week.block.replace(/_/g, " ");
+    if (field === "is_backoff") return week.is_backoff ? "back-off" : "normal";
+    return "";
+  }
+
+  function renderVersionDiffTable(weekDiffs) {
+    if (!weekDiffs.length) return `<p class="hint-text">No week-level changes recorded.</p>`;
+    const rows = weekDiffs.map((d) => {
+      if (d.change_type === "added") {
+        return `<tr><td>wk ${d.week_number}</td><td class="diff-added">+ added</td>
+          <td colspan="2">${escapeHtml(formatWeekValue("block", d.new))} · ${formatWeekValue("target_volume_mi", d.new)} · LR ${formatWeekValue("long_run_mi", d.new)}</td></tr>`;
+      }
+      if (d.change_type === "removed") {
+        return `<tr><td>wk ${d.week_number}</td><td class="diff-removed">removed</td><td colspan="2">was ${escapeHtml(formatWeekValue("block", d.old))}</td></tr>`;
+      }
+      const fields = d.changed_fields.map((f) => `
+        <div><span class="hint-text">${fieldLabel(f)}:</span>
+          <span class="diff-old">${escapeHtml(formatWeekValue(f, d.old))}</span>
+          <span class="diff-new">${escapeHtml(formatWeekValue(f, d.new))}</span>
+        </div>
+      `).join("");
+      return `<tr><td>wk ${d.week_number}</td><td>changed</td><td colspan="2">${fields}</td></tr>`;
+    }).join("");
+    return `<table><tbody>${rows}</tbody></table>`;
+  }
+
+  function renderPlanHistory(payload) {
+    const body = $("#plan-history-body");
+    const versions = payload.versions || [];
+    if (!versions.length) {
+      body.innerHTML = `<p class="loading">No plan history yet.</p>`;
+      return;
+    }
+    body.innerHTML = `<div class="version-list">${versions.map((v) => `
+      <div class="version-row" data-version="${v.version}">
+        <div class="version-row-head">
+          <span class="expand-icon">▸</span>
+          <span class="version-badge">v${v.version}</span>
+          <span class="trigger-badge trigger-${v.trigger}">${v.trigger.replace(/_/g, " ")}</span>
+          <span class="version-date">${new Date(v.created_at).toLocaleString()}</span>
+          <span class="version-changed">${v.weeks_changed_count} week${v.weeks_changed_count === 1 ? "" : "s"} changed</span>
+        </div>
+        <div class="version-rationale">${escapeHtml(v.rationale)}</div>
+        <div class="version-diff-detail">${renderVersionDiffTable(v.week_diffs)}</div>
+      </div>
+    `).join("")}</div>`;
+
+    $$(".version-row-head", body).forEach((head) => {
+      head.addEventListener("click", () => head.parentElement.classList.toggle("expanded"));
+    });
+  }
+
   async function loadUpcoming() {
     try {
-      const [today, plan] = await Promise.all([api("/api/today"), api("/api/plan")]);
+      const [today, plan, history] = await Promise.all([api("/api/today"), api("/api/plan"), api("/api/plan/history")]);
       renderToday(today);
       renderPlan(plan);
+      renderPlanHistory(history);
     } catch (e) {
       $("#today-body").innerHTML = `<p class="loading">Couldn't load: ${escapeHtml(e.message || String(e))}</p>`;
     }

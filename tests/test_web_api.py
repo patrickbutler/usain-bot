@@ -89,7 +89,14 @@ class TestPlanEndpoint:
         client.get("/api/today")
         client.post("/api/today/refresh")
         resp = client.get("/api/plan/history")
-        assert len(resp.json()["versions"]) >= 2
+        versions = resp.json()["versions"]
+        assert len(versions) >= 2
+        # newest first
+        assert versions[0]["version"] > versions[1]["version"]
+        for v in versions:
+            assert "diff_text" in v
+            assert "week_diffs" in v
+            assert "weeks_changed_count" in v
 
 
 class TestHistoryEndpoint:

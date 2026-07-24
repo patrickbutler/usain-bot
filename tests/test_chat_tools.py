@@ -45,6 +45,25 @@ class TestReadTools:
         assert result["plan_version"] >= 1
         assert len(result["weeks"]) > 10
 
+    def test_get_plan_history_empty(self, service):
+        result = tools.tool_get_plan_history(service, {})
+        assert result["versions"] == []
+
+    def test_get_plan_history_after_changes(self, service):
+        service.get_today(date(2026, 7, 24))
+        service.refresh_today(date(2026, 7, 25))
+        result = tools.tool_get_plan_history(service, {})
+        assert len(result["versions"]) == 2
+        assert result["versions"][0]["version"] == 2  # newest first
+        assert "diff_text" in result["versions"][0]
+
+    def test_get_plan_history_respects_limit(self, service):
+        service.get_today(date(2026, 7, 24))
+        for i in range(5):
+            service.refresh_today(date(2026, 7, 25))
+        result = tools.tool_get_plan_history(service, {"limit": 2})
+        assert len(result["versions"]) == 2
+
     def test_get_run_history(self, service):
         service.sync(date(2026, 7, 24))
         result = tools.tool_get_run_history(service, {"days": 90})

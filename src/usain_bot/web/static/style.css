@@ -173,6 +173,39 @@ th { color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transf
 tr.backoff { background: var(--surface-2); }
 .week-tag { display: inline-block; padding: 2px 8px; border-radius: 6px; background: var(--chip-bg); font-size: 0.72rem; }
 
+.hint-text { font-size: 0.78rem; color: var(--text-muted); }
+
+/* --- Plan history --- */
+.version-list { display: flex; flex-direction: column; gap: 8px; }
+.version-row { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.version-row-head {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer;
+  background: var(--surface); flex-wrap: wrap;
+}
+.version-row-head:hover { background: var(--surface-2); }
+.version-badge { font-weight: 700; font-size: 0.85rem; width: 32px; flex-shrink: 0; }
+.version-date { color: var(--text-muted); font-size: 0.78rem; }
+.version-changed { color: var(--text-muted); font-size: 0.78rem; margin-left: auto; }
+.expand-icon { color: var(--text-muted); transition: transform 0.15s ease; flex-shrink: 0; }
+.version-row.expanded .expand-icon { transform: rotate(90deg); }
+
+.trigger-badge {
+  font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 3px 8px; border-radius: 999px; background: var(--chip-bg); color: var(--text-muted);
+}
+.trigger-user_override { background: var(--accent-soft); color: var(--accent); }
+.trigger-first_run { background: var(--chip-bg); color: var(--text); }
+.trigger-gap_detected, .trigger-gap_regeneration { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 18%, var(--chip-bg)); }
+
+.version-rationale { padding: 0 12px 10px; font-size: 0.84rem; color: var(--text-muted); }
+.version-diff-detail { display: none; padding: 0 12px 12px; }
+.version-row.expanded .version-diff-detail { display: block; }
+.version-diff-detail table { font-size: 0.8rem; }
+.diff-added { color: var(--green); }
+.diff-removed { color: var(--red); text-decoration: line-through; }
+.diff-old { color: var(--text-muted); text-decoration: line-through; margin-right: 6px; }
+.diff-new { font-weight: 600; }
+
 /* --- History --- */
 .bars { display: flex; align-items: flex-end; gap: 3px; height: 140px; padding-top: 10px; }
 .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 4px; }

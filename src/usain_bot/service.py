@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import agent
+from . import planner
 from .classification import classify_activities
 from .config import Config
 from .garmin_adapter.base import GarminAdapter
@@ -135,6 +136,30 @@ class CoachService:
 
     def get_plan_history(self) -> list[PlanVersion]:
         return self.storage.get_plan_history()
+
+    def get_plan_history_payload(self) -> dict:
+        """The full lineage of the plan, newest first: every version with
+        its trigger, rationale, the stored text diff, and a structured
+        per-week diff against the immediately preceding version (computed
+        on the fly from the already-loaded weeks — nothing extra to store
+        or keep in sync)."""
+        versions = self.storage.get_plan_history()
+        entries = []
+        for i, pv in enumerate(versions):
+            prior = versions[i - 1] if i > 0 else None
+            week_diffs = planner.diff_plan_weeks(prior, pv)
+            changed_weeks = [d for d in week_diffs if d.change_type != "unchanged"]
+            entries.append({
+                "version": pv.version,
+                "created_at": pv.created_at.isoformat(),
+                "trigger": pv.trigger,
+                "rationale": pv.rationale,
+                "diff_text": pv.diff_from_prior,
+                "week_diffs": [d.to_dict() for d in changed_weeks],
+                "weeks_changed_count": len(changed_weeks),
+            })
+        entries.reverse()  # newest first
+        return {"versions": entries}
 
     def get_history(self, days: int = 90) -> list[ClassifiedActivity]:
         activities = self.storage.get_activities()
