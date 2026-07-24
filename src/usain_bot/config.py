@@ -68,12 +68,20 @@ class StorageConfig:
 
 
 @dataclass
+class ChatConfig:
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-5"
+    max_tokens: int = 1536
+
+
+@dataclass
 class Config:
     athlete: AthleteConfig
     goals: list[GoalConfig]
     sequencing: SequencingConfig
     guardrails: GuardrailConfig
     storage: StorageConfig
+    chat: ChatConfig
     raw: dict[str, Any] = field(default_factory=dict)
 
     def goal(self, name: str) -> Optional[GoalConfig]:
@@ -102,12 +110,20 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH, env_path: Optional[str |
         references_dir=local_raw.get("references_dir", "references"),
     )
 
+    chat_raw = raw.get("chat", {})
+    chat = ChatConfig(
+        provider=os.environ.get("USAIN_BOT_CHAT_PROVIDER", chat_raw.get("provider", "anthropic")),
+        model=os.environ.get("USAIN_BOT_CHAT_MODEL", chat_raw.get("model", "claude-sonnet-5")),
+        max_tokens=int(chat_raw.get("max_tokens", 1536)),
+    )
+
     return Config(
         athlete=athlete,
         goals=goals,
         sequencing=sequencing,
         guardrails=guardrails,
         storage=storage,
+        chat=chat,
         raw=raw,
     )
 

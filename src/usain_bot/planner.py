@@ -280,6 +280,102 @@ def _first_future_week(plan: PlanVersion, as_of: date) -> Optional[PlanWeek]:
     return min(upcoming, key=lambda w: w.start_date) if upcoming else None
 
 
+# These three functions are the actual mutations behind every override,
+# whether it arrives via the CLI's regex-based `apply_override` (below) or
+# the chat UI's LLM tool-calls (usain_bot/chat/tools.py) — the LLM never
+# computes a new volume/long-run/date itself, it only ever picks which of
+# these to call and with what arguments; the arithmetic still lives here.
+
+def ease_week(
+    plan: PlanVersion, week_number: Optional[int], as_of: date, reason: str,
+    factor: float = OVERRIDE_EASIER_WEEK_FACTOR,
+) -> OverrideResult:
+    """Reduce a specific (or the next upcoming) week's volume/long-run by
+    `factor` and mark it as a manual back-off."""
+    if week_number is None:
+        target = _first_future_week(plan, as_of)
+        if target is None:
+            return OverrideResult(None, False, "No upcoming week found to ease.", ["No future week in the current plan to modify."])
+        week_number = target.week_number
+    else:
+        target = next((w for w in plan.weeks if w.week_number == week_number), None)
+        if target is None:
+            return OverrideResult(None, False, "", [f"No week {week_number} in the current plan."])
+
+    factor = min(max(factor, 0.3), 0.95)
+    warnings: list[str] = []
+    new_weeks = []
+    for w in plan.weeks:
+        if w.week_number == week_number:
+            new_volume = w.target_volume_mi * factor
+            new_long_run = w.long_run_mi * factor
+            if new_volume < w.target_volume_mi * gr.BACKOFF_VOLUME_PCT_LOW * 0.8:
+                warnings.append(
+                    f"Week {w.week_number} volume cut to {new_volume:.1f} mi is below typical "
+                    "back-off floor — this is more conservative than the standard guardrail, which is fine."
+                )
+            new_weeks.append(PlanWeek(
+                w.week_number, w.start_date, w.block, new_volume, new_long_run, 0,
+                True, f"User override: eased per request ('{reason}').",
+            ))
+        else:
+            new_weeks.append(w)
+    new_plan = PlanVersion(
+        version=plan.version + 1, created_at=datetime.utcnow(), trigger="user_override",
+        rationale=f"User requested an easier week {week_number}: \"{reason}\".",
+        weeks=new_weeks,
+    )
+    return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+
+
+def shift_marathon(
+    plan: PlanVersion, config: Config, anchors: Anchors, as_of: date, weeks: int, reason: str,
+) -> OverrideResult:
+    """Shift the marathon date by `weeks` (positive = later, negative =
+    earlier) and regenerate the full downstream arc from it."""
+    marathon_goal = config.goal("marathon")
+    if not marathon_goal or not marathon_goal.date:
+        return OverrideResult(None, False, "", ["No marathon date configured to shift."])
+    cur_date = date.fromisoformat(marathon_goal.date)
+    new_date = cur_date + timedelta(weeks=weeks)
+    direction = "later" if weeks > 0 else "earlier"
+    warnings = [
+        f"Marathon date shifted from {cur_date.isoformat()} to {new_date.isoformat()} ({abs(weeks)} week(s) {direction}). "
+        "This changes the whole downstream arc (taper, recovery, ultra block start) — "
+        "update config.yaml goals.marathon.date to persist this beyond one session."
+    ]
+    new_plan = generate_macro_plan(
+        config, anchors, as_of, plan.version + 1, "user_override",
+        f"User requested shifting the marathon {abs(weeks)} week(s) {direction}: \"{reason}\".",
+        marathon_date_override=new_date,
+    )
+    return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+
+
+def note_long_run_day(plan: PlanVersion, day: str, reason: str) -> OverrideResult:
+    """Record a long-run day-of-week preference as a note on every future
+    week. Not a per-day schedule structure in this version (see warning)."""
+    new_weeks = [
+        PlanWeek(
+            w.week_number, w.start_date, w.block, w.target_volume_mi, w.long_run_mi,
+            w.quality_sessions, w.is_backoff,
+            (w.notes + f" | Long run day preference: {day}.").strip(" |"),
+        )
+        for w in plan.weeks
+    ]
+    new_plan = PlanVersion(
+        version=plan.version + 1, created_at=datetime.utcnow(), trigger="user_override",
+        rationale=f"User requested moving the long run to {day}: \"{reason}\".",
+        weeks=new_weeks,
+    )
+    warnings = [
+        "Day-of-week scheduling is tracked as a preference note, not a per-day plan structure "
+        "in this version — the 7-day rolling view will honor it, but it isn't guardrail-checked "
+        "for spacing (e.g. back-to-back hard days)."
+    ]
+    return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+
+
 def apply_override(
     plan: PlanVersion,
     text: str,
@@ -287,39 +383,16 @@ def apply_override(
     anchors: Anchors,
     as_of: date,
 ) -> OverrideResult:
-    """Apply a small set of recognized conversational overrides. Anything
-    else is returned unapplied with a warning rather than silently
-    guessing at intent.
+    """Regex-based override parser used by the CLI. Recognizes a small,
+    fixed set of phrasings and dispatches to the same mutation functions
+    the chat UI's LLM tools call. Anything else is returned unapplied
+    with a warning rather than silently guessing at intent — for freer
+    phrasing, use the chat UI instead.
     """
     lowered = text.lower().strip()
-    warnings: list[str] = []
 
     if re.search(r"(make|keep).{0,20}next week.{0,20}eas(y|ier)", lowered):
-        target = _first_future_week(plan, as_of)
-        if target is None:
-            return OverrideResult(None, False, "No upcoming week found to ease.", ["No future week in the current plan to modify."])
-        new_weeks = []
-        for w in plan.weeks:
-            if w.week_number == target.week_number:
-                new_volume = w.target_volume_mi * OVERRIDE_EASIER_WEEK_FACTOR
-                new_long_run = w.long_run_mi * OVERRIDE_EASIER_WEEK_FACTOR
-                if new_volume < w.target_volume_mi * gr.BACKOFF_VOLUME_PCT_LOW * 0.8:
-                    warnings.append(
-                        f"Week {w.week_number} volume cut to {new_volume:.1f} mi is below typical "
-                        "back-off floor — this is more conservative than the standard guardrail, which is fine."
-                    )
-                new_weeks.append(PlanWeek(
-                    w.week_number, w.start_date, w.block, new_volume, new_long_run, 0,
-                    True, f"User override: eased per request ('{text}').",
-                ))
-            else:
-                new_weeks.append(w)
-        new_plan = PlanVersion(
-            version=plan.version + 1, created_at=datetime.utcnow(), trigger="user_override",
-            rationale=f"User requested an easier week {target.week_number}: \"{text}\".",
-            weeks=new_weeks,
-        )
-        return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+        return ease_week(plan, None, as_of, text)
 
     m = re.search(r"shift.{0,20}marathon.{0,20}back (\w+) weeks?", lowered) or \
         re.search(r"push.{0,20}marathon.{0,20}back (\w+) weeks?", lowered)
@@ -327,48 +400,17 @@ def apply_override(
         n = _word_to_int(m.group(1))
         if n is None:
             return OverrideResult(None, False, "", [f"Could not parse a week count from: '{text}'."])
-        marathon_goal = config.goal("marathon")
-        cur_date = date.fromisoformat(marathon_goal.date)
-        new_date = cur_date + timedelta(weeks=n)
-        warnings.append(
-            f"Marathon date shifted from {cur_date.isoformat()} to {new_date.isoformat()}. "
-            "This changes the whole downstream arc (taper, recovery, ultra block start) — "
-            "update config.yaml goals.marathon.date to persist this beyond one session."
-        )
-        new_plan = generate_macro_plan(
-            config, anchors, as_of, plan.version + 1, "user_override",
-            f"User requested shifting the marathon block back {n} week(s): \"{text}\".",
-            marathon_date_override=new_date,
-        )
-        return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+        return shift_marathon(plan, config, anchors, as_of, n, text)
 
-    if re.search(r"move.{0,20}long run.{0,20}to\s+(\w+)", lowered):
-        day_match = re.search(r"move.{0,20}long run.{0,20}to\s+(\w+)", lowered)
-        day = day_match.group(1) if day_match else "unspecified"
-        new_weeks = [
-            PlanWeek(
-                w.week_number, w.start_date, w.block, w.target_volume_mi, w.long_run_mi,
-                w.quality_sessions, w.is_backoff,
-                (w.notes + f" | Long run day preference: {day}.").strip(" |"),
-            )
-            for w in plan.weeks
-        ]
-        new_plan = PlanVersion(
-            version=plan.version + 1, created_at=datetime.utcnow(), trigger="user_override",
-            rationale=f"User requested moving the long run to {day}: \"{text}\".",
-            weeks=new_weeks,
-        )
-        warnings.append(
-            "Day-of-week scheduling is tracked as a preference note, not a per-day plan structure "
-            "in this version — the 7-day rolling view will honor it, but it isn't guardrail-checked "
-            "for spacing (e.g. back-to-back hard days)."
-        )
-        return OverrideResult(new_plan, True, new_plan.rationale, warnings)
+    day_match = re.search(r"move.{0,20}long run.{0,20}to\s+(\w+)", lowered)
+    if day_match:
+        return note_long_run_day(plan, day_match.group(1), text)
 
     return OverrideResult(
         None, False, "",
         [f"Override not recognized: \"{text}\". Supported: easing next week, shifting the marathon "
-         "date, moving the long run to a given day. Rephrase or edit config.yaml directly."],
+         "date, moving the long run to a given day. Rephrase, edit config.yaml directly, or use the "
+         "chat UI (`usain-bot serve`) for freer phrasing."],
     )
 
 

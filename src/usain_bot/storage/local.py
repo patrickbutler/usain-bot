@@ -6,6 +6,13 @@ Reference *documents* additionally get written verbatim to a filesystem
 directory, mirroring the local.data_dir/local.references_dir split — this
 is the same shape the GCP backend uses (BigQuery for structured,
 GCS for documents), so lifting later is a swap, not a rewrite.
+
+Thread-safety: the web server (web/app.py) runs each request's sync
+route handler in a threadpool worker thread, so this backend can't
+assume single-threaded access the way the CLI could. The connection is
+opened with check_same_thread=False and every public method serializes
+through a single lock — simplest correct answer at the scale of one
+local SQLite file for one user, rather than a connection pool.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -119,8 +127,9 @@ class LocalBackend(StorageBackend):
         self.references_path = self.data_dir / references_dir
         self.references_path.mkdir(parents=True, exist_ok=True)
 
+        self._lock = threading.RLock()
         self.db_path = self.data_dir / db_filename
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -138,37 +147,40 @@ class LocalBackend(StorageBackend):
             return False
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # --- activities -----------------------------------------------------------
 
     def save_activities(self, activities: list[Activity]) -> int:
         now = datetime.utcnow().isoformat()
         new_count = 0
-        for a in activities:
-            cur = self._conn.execute(
-                """INSERT OR IGNORE INTO activities
-                   (activity_id, date, activity_type, distance_mi, duration_s,
-                    avg_pace_min_per_mi, avg_hr, max_hr, elevation_gain_ft, name,
-                    raw_json, synced_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    a.activity_id, a.date.isoformat(), a.activity_type.value, a.distance_mi,
-                    a.duration_s, a.avg_pace_min_per_mi, a.avg_hr, a.max_hr,
-                    a.elevation_gain_ft, a.name, json.dumps(a.raw), now,
-                ),
-            )
-            new_count += cur.rowcount
-        self._conn.commit()
+        with self._lock:
+            for a in activities:
+                cur = self._conn.execute(
+                    """INSERT OR IGNORE INTO activities
+                       (activity_id, date, activity_type, distance_mi, duration_s,
+                        avg_pace_min_per_mi, avg_hr, max_hr, elevation_gain_ft, name,
+                        raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        a.activity_id, a.date.isoformat(), a.activity_type.value, a.distance_mi,
+                        a.duration_s, a.avg_pace_min_per_mi, a.avg_hr, a.max_hr,
+                        a.elevation_gain_ft, a.name, json.dumps(a.raw), now,
+                    ),
+                )
+                new_count += cur.rowcount
+            self._conn.commit()
         return new_count
 
     def get_activities(self, since: Optional[datetime] = None) -> list[Activity]:
-        if since is not None:
-            rows = self._conn.execute(
-                "SELECT * FROM activities WHERE date >= ? ORDER BY date", (since.date().isoformat(),)
-            ).fetchall()
-        else:
-            rows = self._conn.execute("SELECT * FROM activities ORDER BY date").fetchall()
+        with self._lock:
+            if since is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM activities WHERE date >= ? ORDER BY date", (since.date().isoformat(),)
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM activities ORDER BY date").fetchall()
         return [self._row_to_activity(r) for r in rows]
 
     @staticmethod
@@ -188,39 +200,44 @@ class LocalBackend(StorageBackend):
         )
 
     def get_last_sync_time(self) -> Optional[datetime]:
-        row = self._conn.execute("SELECT value FROM sync_state WHERE key = 'last_sync_time'").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM sync_state WHERE key = 'last_sync_time'").fetchone()
         return datetime.fromisoformat(row["value"]) if row else None
 
     def set_last_sync_time(self, ts: datetime) -> None:
-        self._conn.execute(
-            "INSERT INTO sync_state (key, value) VALUES ('last_sync_time', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (ts.isoformat(),),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES ('last_sync_time', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (ts.isoformat(),),
+            )
+            self._conn.commit()
 
     # --- plan_versions --------------------------------------------------------
 
     def save_plan_version(self, plan_version: PlanVersion) -> None:
-        self._conn.execute(
-            """INSERT INTO plan_versions (version, created_at, trigger_reason, rationale,
-               diff_from_prior, weeks_json) VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                plan_version.version, plan_version.created_at.isoformat(), plan_version.trigger,
-                plan_version.rationale, plan_version.diff_from_prior,
-                json.dumps([w.to_dict() for w in plan_version.weeks]),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO plan_versions (version, created_at, trigger_reason, rationale,
+                   diff_from_prior, weeks_json) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_version.version, plan_version.created_at.isoformat(), plan_version.trigger,
+                    plan_version.rationale, plan_version.diff_from_prior,
+                    json.dumps([w.to_dict() for w in plan_version.weeks]),
+                ),
+            )
+            self._conn.commit()
 
     def get_latest_plan_version(self) -> Optional[PlanVersion]:
-        row = self._conn.execute(
-            "SELECT * FROM plan_versions ORDER BY version DESC LIMIT 1"
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM plan_versions ORDER BY version DESC LIMIT 1"
+            ).fetchone()
         return self._row_to_plan_version(row) if row else None
 
     def get_plan_history(self) -> list[PlanVersion]:
-        rows = self._conn.execute("SELECT * FROM plan_versions ORDER BY version").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM plan_versions ORDER BY version").fetchall()
         return [self._row_to_plan_version(r) for r in rows]
 
     @staticmethod
@@ -251,17 +268,19 @@ class LocalBackend(StorageBackend):
     # --- conversations ----------------------------------------------------------
 
     def save_conversation_entry(self, entry: ConversationEntry) -> None:
-        self._conn.execute(
-            "INSERT INTO conversations (timestamp, role, text, metadata_json) VALUES (?, ?, ?, ?)",
-            (entry.timestamp.isoformat(), entry.role, entry.text, json.dumps(entry.metadata)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO conversations (timestamp, role, text, metadata_json) VALUES (?, ?, ?, ?)",
+                (entry.timestamp.isoformat(), entry.role, entry.text, json.dumps(entry.metadata)),
+            )
+            self._conn.commit()
 
     def get_conversation_history(self, limit: Optional[int] = None) -> list[ConversationEntry]:
         query = "SELECT * FROM conversations ORDER BY id"
         if limit:
             query += f" DESC LIMIT {int(limit)}"
-        rows = self._conn.execute(query).fetchall()
+        with self._lock:
+            rows = self._conn.execute(query).fetchall()
         entries = [
             ConversationEntry(
                 timestamp=datetime.fromisoformat(r["timestamp"]),
@@ -279,26 +298,28 @@ class LocalBackend(StorageBackend):
         file_path = self.references_path / f"{doc.doc_id}.md"
         file_path.write_text(doc.content, encoding="utf-8")
 
-        self._conn.execute(
-            """INSERT INTO reference_docs (doc_id, title, source, added_at, file_path)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(doc_id) DO UPDATE SET title=excluded.title, source=excluded.source,
-               added_at=excluded.added_at, file_path=excluded.file_path""",
-            (doc.doc_id, doc.title, doc.source, doc.added_at.isoformat(), str(file_path)),
-        )
-        self._conn.execute("DELETE FROM reference_chunks WHERE doc_id = ?", (doc.doc_id,))
-        for i, chunk_text in enumerate(_chunk_text(doc.content, doc.title)):
+        with self._lock:
             self._conn.execute(
-                "INSERT INTO reference_chunks (doc_id, chunk_index, title, text) VALUES (?, ?, ?, ?)",
-                (doc.doc_id, i, doc.title, chunk_text),
+                """INSERT INTO reference_docs (doc_id, title, source, added_at, file_path)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(doc_id) DO UPDATE SET title=excluded.title, source=excluded.source,
+                   added_at=excluded.added_at, file_path=excluded.file_path""",
+                (doc.doc_id, doc.title, doc.source, doc.added_at.isoformat(), str(file_path)),
             )
-        self._conn.commit()
-        if self._fts_available:
-            self._conn.execute("INSERT INTO reference_chunks_fts(reference_chunks_fts) VALUES('rebuild')")
+            self._conn.execute("DELETE FROM reference_chunks WHERE doc_id = ?", (doc.doc_id,))
+            for i, chunk_text in enumerate(_chunk_text(doc.content, doc.title)):
+                self._conn.execute(
+                    "INSERT INTO reference_chunks (doc_id, chunk_index, title, text) VALUES (?, ?, ?, ?)",
+                    (doc.doc_id, i, doc.title, chunk_text),
+                )
             self._conn.commit()
+            if self._fts_available:
+                self._conn.execute("INSERT INTO reference_chunks_fts(reference_chunks_fts) VALUES('rebuild')")
+                self._conn.commit()
 
     def list_references(self) -> list[ReferenceDoc]:
-        rows = self._conn.execute("SELECT * FROM reference_docs ORDER BY added_at").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM reference_docs ORDER BY added_at").fetchall()
         docs = []
         for r in rows:
             content = Path(r["file_path"]).read_text(encoding="utf-8")
@@ -315,28 +336,30 @@ class LocalBackend(StorageBackend):
         if not terms:
             return []
 
-        if self._fts_available:
-            fts_query = " OR ".join(terms)
-            try:
-                rows = self._conn.execute(
-                    """SELECT rc.doc_id, rc.chunk_index, rc.title, rc.text, bm25(reference_chunks_fts) AS rank
-                       FROM reference_chunks_fts
-                       JOIN reference_chunks rc ON rc.rowid = reference_chunks_fts.rowid
-                       WHERE reference_chunks_fts MATCH ?
-                       ORDER BY rank LIMIT ?""",
-                    (fts_query, top_k),
-                ).fetchall()
-                if rows:
-                    return [
-                        ReferenceChunk(doc_id=r["doc_id"], chunk_index=r["chunk_index"], text=r["text"],
-                                        title=r["title"], score=-r["rank"])
-                        for r in rows
-                    ]
-            except sqlite3.OperationalError:
-                pass
+        with self._lock:
+            if self._fts_available:
+                fts_query = " OR ".join(terms)
+                try:
+                    rows = self._conn.execute(
+                        """SELECT rc.doc_id, rc.chunk_index, rc.title, rc.text, bm25(reference_chunks_fts) AS rank
+                           FROM reference_chunks_fts
+                           JOIN reference_chunks rc ON rc.rowid = reference_chunks_fts.rowid
+                           WHERE reference_chunks_fts MATCH ?
+                           ORDER BY rank LIMIT ?""",
+                        (fts_query, top_k),
+                    ).fetchall()
+                    if rows:
+                        return [
+                            ReferenceChunk(doc_id=r["doc_id"], chunk_index=r["chunk_index"], text=r["text"],
+                                            title=r["title"], score=-r["rank"])
+                            for r in rows
+                        ]
+                except sqlite3.OperationalError:
+                    pass
 
-        # Fallback: naive term-frequency keyword scoring (no FTS5 available).
-        rows = self._conn.execute("SELECT * FROM reference_chunks").fetchall()
+            # Fallback: naive term-frequency keyword scoring (no FTS5 available).
+            rows = self._conn.execute("SELECT * FROM reference_chunks").fetchall()
+
         scored = []
         for r in rows:
             text_lower = r["text"].lower()
@@ -353,16 +376,18 @@ class LocalBackend(StorageBackend):
     # --- health flags (§5.8) ---------------------------------------------------------
 
     def save_health_flag(self, flag: HealthFlag) -> None:
-        self._conn.execute(
-            "INSERT INTO health_flags (timestamp, flag, note) VALUES (?, ?, ?)",
-            (flag.timestamp.isoformat(), flag.flag, flag.note),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO health_flags (timestamp, flag, note) VALUES (?, ?, ?)",
+                (flag.timestamp.isoformat(), flag.flag, flag.note),
+            )
+            self._conn.commit()
 
     def get_recent_health_flags(self, days: int = 30) -> list[HealthFlag]:
-        rows = self._conn.execute(
-            "SELECT * FROM health_flags ORDER BY timestamp DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM health_flags ORDER BY timestamp DESC"
+            ).fetchall()
         cutoff = datetime.utcnow().timestamp() - days * 86400
         flags = []
         for r in rows:

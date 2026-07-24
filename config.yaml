@@ -47,3 +47,8 @@ storage:
     data_dir: ./data
     db_filename: usain_bot.db
     references_dir: references
+
+chat:
+  provider: anthropic              # only provider implemented today — see chat/providers/
+  model: claude-sonnet-5
+  max_tokens: 1536

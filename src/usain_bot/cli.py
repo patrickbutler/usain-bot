@@ -8,9 +8,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,8 @@ from .config import Config, GarminCredentials, load_config
 from .garmin_adapter.base import GarminAdapter
 from .garmin_adapter.live import GarminConnectAdapter
 from .garmin_adapter.mock import MockGarminAdapter
-from .models import Recommendation, ReferenceDoc
+from .models import ReferenceDoc
+from .projection import DayProjection, project_next_7_days
 from .storage import get_storage_backend
 
 VALID_FLAGS = ("hip", "back", "fatigue")
@@ -38,45 +40,7 @@ def _build_adapter(mock_fixture: Optional[str]) -> GarminAdapter:
     return GarminConnectAdapter(GarminCredentials.from_env())
 
 
-def _run_days_for_week(run_days_per_week: int) -> list[int]:
-    run_days_per_week = max(1, min(run_days_per_week, 7))
-    return sorted({min(round(i * 7 / run_days_per_week) + 1, 6) for i in range(run_days_per_week)})
-
-
-def _project_next_7_days(as_of: date, this_week_notes: str, next_week_block: str,
-                          run_days_per_week: int, quality_target: int, is_backoff: bool,
-                          recommendation: Recommendation) -> list[dict]:
-    run_days = _run_days_for_week(run_days_per_week)
-    long_day = max(run_days)
-    quality_day = min(run_days) if quality_target > 0 and not is_backoff else None
-
-    out = []
-    for offset in range(7):
-        d = as_of + timedelta(days=offset)
-        weekday = d.weekday()
-        if offset == 0:
-            out.append({
-                "date": d.isoformat(), "weekday": d.strftime("%A"),
-                "run_type": recommendation.run_type,
-                "distance_mi": recommendation.target_distance_mi,
-                "note": "today's recommendation",
-            })
-        elif weekday not in run_days:
-            out.append({"date": d.isoformat(), "weekday": d.strftime("%A"), "run_type": "rest_or_cross_training",
-                        "distance_mi": None, "note": ""})
-        elif weekday == long_day:
-            out.append({"date": d.isoformat(), "weekday": d.strftime("%A"), "run_type": "long",
-                        "distance_mi": None, "note": "projected — actual distance decided live on that day"})
-        elif weekday == quality_day:
-            out.append({"date": d.isoformat(), "weekday": d.strftime("%A"), "run_type": "quality",
-                        "distance_mi": None, "note": "projected"})
-        else:
-            out.append({"date": d.isoformat(), "weekday": d.strftime("%A"), "run_type": "easy",
-                        "distance_mi": None, "note": "projected"})
-    return out
-
-
-def _format_text_output(result: "agent.InvocationResult", config: Config, next7: list[dict]) -> str:
+def _format_text_output(result: "agent.InvocationResult", config: Config, next7: list[DayProjection]) -> str:
     rec = result.recommendation
     anchors = result.anchors
     plan = result.plan
@@ -108,8 +72,8 @@ def _format_text_output(result: "agent.InvocationResult", config: Config, next7:
     lines.append("-" * 70)
     lines.append("Next 7 days:")
     for day in next7:
-        dist = f"{day['distance_mi']:.1f} mi" if day["distance_mi"] else ""
-        lines.append(f"  {day['date']} ({day['weekday']:<9}) {day['run_type']:<20} {dist} {day['note']}")
+        dist = f"{day.distance_mi:.1f} mi" if day.distance_mi else ""
+        lines.append(f"  {day.date.isoformat()} ({day.weekday:<9}) {day.run_type:<20} {dist} {day.note}")
     lines.append("")
     lines.append("Remainder of the plan, week by week:")
     for w in plan.weeks:
@@ -166,10 +130,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         health_flag=args.flag, dry_run=args.dry_run,
     )
 
-    next7 = _project_next_7_days(
-        result.recommendation.date, result.plan.weeks[0].notes, result.plan.weeks[1].block if len(result.plan.weeks) > 1 else "",
-        config.athlete.available_run_days_per_week, result.plan.weeks[0].quality_sessions,
-        result.plan.weeks[0].is_backoff, result.recommendation,
+    next7 = project_next_7_days(
+        result.recommendation.date, config.athlete.available_run_days_per_week,
+        result.plan.weeks[0].quality_sessions, result.plan.weeks[0].is_backoff, result.recommendation,
     )
 
     print(_format_text_output(result, config, next7))
@@ -285,6 +248,23 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0 if result.live else 1
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from .web.app import create_app
+
+    config = load_config(args.config)
+    storage = get_storage_backend(config)
+    adapter_ = _build_adapter(args.mock_fixture)
+    app = create_app(config, storage, adapter_)
+
+    print(f"usain-bot web UI at http://{args.host}:{args.port}")
+    if config.chat.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+        print("[!] ANTHROPIC_API_KEY not set — every tab except Chat will still work.")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info" if args.verbose else "warning")
+    return 0
+
+
 def cmd_reference_add(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     storage = get_storage_backend(config)
@@ -378,6 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ref_search.add_argument("query")
     p_ref_search.add_argument("--top-k", type=int, default=3)
     p_ref_search.set_defaults(func=cmd_reference_search)
+
+    p_serve = sub.add_parser("serve", help="Run the local web UI (chat + upcoming + history)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8420)
+    p_serve.add_argument("--mock-fixture", help="Path to a mock Garmin activities JSON fixture (for local testing)")
+    p_serve.set_defaults(func=cmd_serve)
 
     return parser
 

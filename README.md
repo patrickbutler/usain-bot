@@ -1,10 +1,11 @@
 # usain-bot
 
 Usain Bot — a local-first, agentic running coach. You invoke it manually
-before a run; it reads your real Garmin activity history, compares what
-you actually ran against what the plan said, reasons about the delta,
-and tells you the optimal distance for today plus a rolling view of the
-rest of the plan.
+before a run (CLI) or leave the local web UI running (`usain-bot serve`);
+it reads your real Garmin activity history, compares what you actually
+ran against what the plan said, reasons about the delta, and tells you
+the optimal distance for today plus a rolling view of the rest of the
+plan.
 
 Injury prevention outranks plan adherence, always. See the design spec
 in the original build prompt for the full rationale; this README covers
@@ -23,23 +24,34 @@ src/usain_bot/
   garmin_adapter/           all Garmin I/O isolated here (live + mock)
   storage/                  StorageBackend ABC + LocalBackend (SQLite+FS) + GCPBackend (stub)
   agent.py                  orchestrates the §4.3 decision procedure end to end
+  service.py                CoachService: today-cache + read helpers shared by web + chat
+  projection.py             shared "next 7 days" rolling view (CLI + web)
   cli.py                    `usain-bot` entrypoint
-tests/                      pytest suite, network-free via MockGarminAdapter
+  chat/
+    providers/               LLMProvider interface + AnthropicProvider (swap vendors here)
+    tools.py                 tool definitions the LLM calls — dispatches into agent/planner
+    session.py                provider-agnostic tool-calling loop
+  web/
+    app.py                   FastAPI REST endpoints
+    static/                  vanilla HTML/CSS/JS frontend (Chat / Upcoming / History tabs)
+tests/                      pytest suite, network-free via MockGarminAdapter + a scripted fake LLM
 references/                 example coaching reference articles you can import
 ```
 
-No agent/planner/guardrail code imports a concrete storage backend or
-the `garminconnect` library directly — everything goes through
-`StorageBackend` and `GarminAdapter`. That's what makes the whole system
-testable offline and lets storage move from local SQLite to GCP later
-without touching reasoning code.
+No agent/planner/guardrail code imports a concrete storage backend, the
+`garminconnect` library, or a concrete LLM SDK directly — everything
+goes through `StorageBackend`, `GarminAdapter`, and `LLMProvider`.
+That's what makes the whole system testable offline and lets storage
+move to GCP, or the chat model move to a different vendor, without
+touching reasoning code.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"       # CLI only
+pip install -e ".[dev,chat]"  # + the web UI's Chat tab (adds the anthropic SDK)
 ```
 
 Copy `.env.example` to `.env` and fill in your Garmin credentials:
@@ -122,6 +134,22 @@ than guessed at; edit `config.yaml` directly for anything not covered.
 If you just run less than recommended, that's not an override — it's
 data, and the next invocation absorbs it into the anchors automatically.
 
+## Web UI
+
+```bash
+usain-bot serve
+```
+
+Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, built entirely on the same `agent`/`planner`/`storage` functions as the CLI — it's a view onto the same system, not a second implementation:
+
+- **Chat** — ask about today's run, the plan, or your history in plain English; apply overrides ("make next week easier," "shift the marathon back two weeks") and mention symptoms ("my hip's been sore") conversationally.
+- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, and the full plan week by week, with one-click hip/back/fatigue flags and a refresh button.
+- **History** — a weekly volume chart and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
+
+Chat needs `ANTHROPIC_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
+
+**Swapping the LLM provider:** `chat/providers/base.py` defines a small provider-agnostic interface (`LLMProvider`, plus normalized `ChatMessage`/`ToolSpec`/`ProviderResponse` types) that `chat/session.py`'s orchestration loop and `chat/tools.py`'s tool definitions depend on — never on the Anthropic SDK directly. To add another vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py`, and set `chat.provider` in `config.yaml` (or `USAIN_BOT_CHAT_PROVIDER`). Nothing else changes.
+
 ## Reference articles
 
 ```bash
@@ -173,12 +201,16 @@ No changes are needed anywhere else — `agent.py`, `planner.py`, and
 pytest
 ```
 
-88+ tests, all network-free. `guardrails.py` functions are pure and
-unit-tested directly, including edge cases (zero chronic load, a >6-week
-gap, a long run exceeding 35% of weekly volume, ACWR undefined at cold
-start). `MockGarminAdapter` reads `tests/fixtures/mock_activities.json`
-so `classification.py`, `planner.py`, and the full `agent.py` decision
-procedure are exercised end to end without a Garmin account.
+130+ tests, all network-free — including chat, which is tested against a
+scripted fake `LLMProvider` (`tests/test_chat_session.py`), never the
+real Anthropic API. `guardrails.py` functions are pure and unit-tested
+directly, including edge cases (zero chronic load, a >6-week gap, a long
+run exceeding 35% of weekly volume, ACWR undefined at cold start).
+`MockGarminAdapter` reads `tests/fixtures/mock_activities.json` so
+`classification.py`, `planner.py`, the full `agent.py` decision
+procedure, the REST API (`tests/test_web_api.py`, via FastAPI's
+`TestClient`), and the chat tool dispatch (`tests/test_chat_tools.py`)
+are all exercised end to end without a Garmin account or an API key.
 
 ## Design notes worth knowing
 
@@ -204,3 +236,23 @@ procedure are exercised end to end without a Garmin account.
   producing a plan that can't get there. Real chronic load re-derived
   from actual training on each future invocation will likely close part
   of that gap; the note says explicitly what would close the rest.
+- **Overrides are best-effort against regeneration, not permanent
+  edits.** `generate_macro_plan` always regenerates the *entire*
+  forward projection fresh from current anchors — that's the design
+  (see the planner.py module docstring). A conversational override
+  (`ease_upcoming_week`, `shift_marathon_date`, ...) writes a new plan
+  version and the web UI's cache is patched in place so it's visible
+  immediately without triggering another regeneration in the same
+  breath (`CoachService.apply_plan_update`) — but the *next* natural
+  regeneration (tomorrow's `usain-bot run`, or the day rolling over in
+  the web UI) recomputes from anchors again and won't remember
+  yesterday's "make next week easier." There's no persistent
+  override-tracking layer yet; if you need a change to stick across
+  days, edit `config.yaml` for anything durable (goal dates, baseline),
+  or re-apply the override each session.
+- **SQLite + a thread pool.** The web server runs each request's
+  handler in a worker thread (FastAPI's default for sync `def` routes),
+  so `LocalBackend` opens its connection with `check_same_thread=False`
+  and serializes every call through a single lock — correct at the
+  scale of one local file for one user, not something to scale up
+  as-is if this ever became multi-user.
