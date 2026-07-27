@@ -14,16 +14,19 @@ setup and day-to-day usage.
 ## How it's put together
 
 ```
-config.yaml                 athlete/goals/guardrail config (edit freely)
+start.sh                    one-command startup (venv, deps, first run, launch UI)
+config.yaml                 athlete/goals/guardrail/sync config (edit freely)
 src/usain_bot/
   models.py                 shared dataclasses/enums, no I/O
   config.py                 loads config.yaml + .env
-  classification.py         raw Garmin activities -> classified runs -> load anchors
+  sessions.py               split-run merging (<=3h gap = one run)
+  classification.py         merged sessions -> classified runs -> load anchors
   guardrails.py             every §5 formula as a pure, unit-tested function
-  planner.py                macro plan generation, versioning, conversational overrides
+  planner.py                goal-driven plan generation from actuals + overrides
+  validation.py             deterministic referee for the milestone/build rules
   garmin_adapter/           all Garmin I/O isolated here (live + mock)
   storage/                  StorageBackend ABC + LocalBackend (SQLite+FS) + GCPBackend (stub)
-  agent.py                  orchestrates the §4.3 decision procedure end to end
+  agent.py                  decision procedure, sync/backfill/dedupe
   service.py                CoachService: today-cache + read helpers shared by web + chat
   projection.py             shared "next 7 days" rolling view (CLI + web)
   cli.py                    `usain-bot` entrypoint
@@ -44,6 +47,17 @@ goes through `StorageBackend`, `GarminAdapter`, and `LLMProvider`.
 That's what makes the whole system testable offline and lets storage
 move to GCP, or the chat model move to a different vendor, without
 touching reasoning code.
+
+## Quick start (one command)
+
+```bash
+./start.sh              # real Garmin data (prompts you to fill in .env on first run)
+./start.sh --demo       # bundled sample data — no Garmin account or API key needed
+```
+
+`start.sh` creates the virtualenv, installs dependencies, generates your
+plan on first run, starts the server, and opens the UI in your browser.
+Safe to re-run. Everything below is the manual equivalent.
 
 ## Setup
 
@@ -142,7 +156,7 @@ usain-bot serve
 
 Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, built entirely on the same `agent`/`planner`/`storage` functions as the CLI — it's a view onto the same system, not a second implementation:
 
-- **Chat** — ask about today's run, the plan, or your history in plain English; apply overrides ("make next week easier," "shift the marathon back two weeks") and mention symptoms ("my hip's been sore") conversationally.
+- **Chat** — your coach, who speaks with a Jamaican accent and plenty of slang (style only — every number, date, and safety warning still comes from the tools, stated plainly). Ask about today's run, the plan, or your history; apply overrides ("make next week easier," "push my half marathon back three weeks"); mention symptoms ("my hip's been sore") or how a run felt ("legs were dead out there") and it records both, which feeds the recommendation math directly.
 - **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override), expandable to see exactly which weeks changed and how.
 - **History** — a weekly volume chart and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
 
@@ -168,6 +182,87 @@ chat:
 
 or via environment variables (`USAIN_BOT_CHAT_PROVIDER=gemini`, `USAIN_BOT_CHAT_MODEL=gemini-2.0-flash`) without touching the file — see the alternate blocks in `.env.example`. To add a fourth vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py` (and one line to its `REQUIRED_ENV_VAR` map so `usain-bot serve`'s startup warning knows which key to check for). Nothing in `chat/session.py`, `chat/tools.py`, or `web/app.py` changes — and `tests/test_chat_providers.py` / `tests/test_chat_providers_gemini.py` exercise every shipped provider's request/response translation directly (mocked SDK calls, no network — none of this has been tested against a live API key in this environment).
 
+## Garmin data pipeline
+
+**Scope:** only running activities are stored — `activityType.typeKey` in
+`running`, `trail_running`, `treadmill_running` (`treadmill` also
+accepted). Cycling, strength, and everything else are filtered out at the
+adapter boundary.
+
+```bash
+usain-bot backfill      # one-time full-history import
+usain-bot sync          # incremental pull (also runs automatically on `run`/`serve`)
+usain-bot dedupe        # find duplicate stored activities (add --apply to remove)
+```
+
+- **Backfill** walks history backwards in bounded chunks (90 days by
+  default) with a pause between each, because a single wide request is
+  what returns HTTP 429. The adapter additionally retries on 429 with a
+  long backoff schedule (30s → 60s → 120s → 240s) versus a short one for
+  ordinary transient failures. If it still gets cut off it says so and is
+  safe to re-run — activities upsert by ID, so resuming never duplicates.
+- **Every sync re-pulls a trailing overlap window** (`sync.overlap_days`,
+  30 by default) rather than only "everything since last sync". That's
+  what catches activities you *edited* on Garmin after they were first
+  imported: `save_activities` upserts, so a corrected distance, duration,
+  name, or HR updates the stored row instead of being ignored as a
+  duplicate. Edits older than the window aren't detected — widen
+  `sync.overlap_days` if you routinely fix up old activities.
+- **Split runs are merged at read time.** If one run is recorded as
+  several activities (watch stopped/restarted), any gap of **≤ 3 hours**
+  between one ending and the next beginning makes them one session;
+  more than 3 hours means genuinely separate runs. Stored rows stay raw
+  and immutable — merging happens in `sessions.py` on the way into
+  classification, so the rule is tunable (`sync.merge_gap_hours`) and
+  re-applies to all history with no migration.
+- **Duplicates** (the same physical run under two Garmin IDs — near
+  identical start time and distance) are a separate concern from split
+  runs, and are found/removed by `usain-bot dedupe`.
+
+## Training rules and plan validation
+
+The plan is generated **from your actual data** — the long-run
+progression starts at your demonstrated long-run anchor and weekly
+volume at your real chronic load. It never schedules a long run below
+what you've already proven you can run.
+
+Milestone rules, enforced deterministically:
+
+| Milestone | Date | Prerequisite | Taper |
+|---|---|---|---|
+| Half marathon | flexible | a 12 mi run before the taper | 1–2 weeks |
+| Marathon | **fixed** (`goals.marathon.date`) | a 20 mi run before the taper | 2–3 weeks |
+| 50K | flexible | ≥30 mi/week for 3 consecutive weeks | 2–3 weeks |
+
+```bash
+usain-bot validate      # check the current plan against every rule above
+```
+
+`validation.py` is a pure, independently-tested referee: the planner aims
+to satisfy the rules, the validator says whether it actually did. It also
+checks gradual build limits (long run within min(1 mi, 10%), volume
+within +10%/week, ignoring expected back-off discontinuities) and
+back-off cadence. Results appear in `usain-bot validate`, the Upcoming
+tab, and `GET /api/plan/validation`.
+
+**Flexible milestones can be pushed** ("move my half marathon back three
+weeks") via chat or `POST /api/milestone/push`. The delay persists as a
+preference — surviving the plan being regenerated from anchors every
+invocation — and the planner fills the extra weeks with normal
+build/back-off weeks so your base is maintained rather than going flat.
+
+## Adapting to you
+
+- **Run frequency is derived from actuals**, not from config: distinct
+  days with a run in the trailing 28 days, ÷4. If you run more or fewer
+  days than `athlete.available_run_days_per_week` says, the plan adapts
+  and the plan rationale notes the mismatch.
+- **How runs felt is remembered and used.** The coach asks about recent
+  unrated runs; you can also rate them in the Upcoming tab (1–5). A poor
+  recent average becomes a hard ceiling candidate
+  (`recent_run_feeling`) in the same min-across-guardrails computation as
+  the load math — this is deterministic Python, not left to the LLM.
+
 ## Reference articles
 
 ```bash
@@ -189,6 +284,14 @@ branch regardless of what the guardrail math would otherwise allow: cap
 at the last completed distance, no quality work, cross-training
 suggested instead. Flags are persisted so the agent can see the pattern
 over time (`storage.get_recent_health_flags()`).
+
+**Flags are undoable.** In the web UI the flag buttons toggle — clicking
+an active flag clears it, and the active flag is shown explicitly on the
+recommendation card so a mis-tap is obvious and reversible. You can also
+say so in chat ("that was a mistake, I'm fine") or call
+`DELETE /api/health-flag`. Clearing recomputes today without the
+conservative cap; the flag stays in history, it just stops constraining
+today.
 
 ## Plan version history
 
@@ -245,7 +348,7 @@ No changes are needed anywhere else — `agent.py`, `planner.py`, and
 pytest
 ```
 
-186+ tests, all network-free — including chat, which is tested at two
+274+ tests, all network-free — including chat, which is tested at two
 levels without ever calling a real LLM API: the orchestration loop
 against a scripted fake `LLMProvider` (`tests/test_chat_session.py`),
 and each shipped provider's actual request/response translation against

@@ -75,6 +75,15 @@ class ChatConfig:
 
 
 @dataclass
+class SyncConfig:
+    overlap_days: int = 30          # re-pull this trailing window every sync to catch edited activities
+    backfill_chunk_days: int = 90   # backfill request window size
+    backfill_pause_s: float = 2.0   # pause between backfill chunks (Garmin rate-limits)
+    backfill_max_empty_chunks: int = 4  # stop backfill after this many consecutive empty chunks
+    merge_gap_hours: float = 3.0    # runs closer together than this are one split session
+
+
+@dataclass
 class Config:
     athlete: AthleteConfig
     goals: list[GoalConfig]
@@ -82,6 +91,7 @@ class Config:
     guardrails: GuardrailConfig
     storage: StorageConfig
     chat: ChatConfig
+    sync: SyncConfig = field(default_factory=SyncConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def goal(self, name: str) -> Optional[GoalConfig]:
@@ -117,6 +127,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH, env_path: Optional[str |
         max_tokens=int(chat_raw.get("max_tokens", 1536)),
     )
 
+    sync = SyncConfig(**raw.get("sync", {}))
+
     return Config(
         athlete=athlete,
         goals=goals,
@@ -124,6 +136,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH, env_path: Optional[str |
         guardrails=guardrails,
         storage=storage,
         chat=chat,
+        sync=sync,
         raw=raw,
     )
 

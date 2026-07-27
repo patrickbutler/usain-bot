@@ -42,7 +42,16 @@ class Activity:
     max_hr: Optional[int] = None
     elevation_gain_ft: Optional[float] = None
     name: Optional[str] = None
+    start_time: Optional[datetime] = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def end_time(self) -> Optional[datetime]:
+        if self.start_time is None:
+            return None
+        from datetime import timedelta
+
+        return self.start_time + timedelta(seconds=self.duration_s)
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,7 @@ class Anchors:
     adherence_rate: Optional[float]    # completed / planned runs, trailing 14 days
     acwr: Optional[float]              # None when chronic_load_mi == 0 (cold start)
     gap: GapInfo
+    runs_per_week: Optional[int] = None  # derived from actual trailing 28 days; None at cold start
 
 
 @dataclass(frozen=True)
@@ -163,6 +173,20 @@ class HealthFlag:
     timestamp: datetime
     flag: str  # "hip" | "back" | "fatigue" | ...
     note: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RunFeedback:
+    """How a run (or a recent stretch of running) felt, 1-5:
+    1=awful/pain, 2=rough, 3=okay, 4=good, 5=great. The agent's memory of
+    subjective state — persisted so the pattern is visible over time and
+    deterministic recommendation logic can bias conservative when the
+    recent average is low."""
+
+    timestamp: datetime
+    score: int
+    comment: Optional[str] = None
+    activity_date: Optional[date] = None
 
 
 @dataclass

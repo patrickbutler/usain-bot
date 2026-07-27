@@ -154,6 +154,69 @@ class TestChatEndpointWithoutApiKey:
         assert resp.status_code == 400
 
 
+class TestHealthFlagUndoEndpoint:
+    def test_delete_clears_active_flag(self, client):
+        client.post("/api/health-flag", json={"flag": "fatigue"})
+        assert client.get("/api/today").json()["active_health_flag"] == "fatigue"
+
+        resp = client.request("DELETE", "/api/health-flag")
+        assert resp.status_code == 200
+        assert resp.json()["active_flag"] is None
+        assert client.get("/api/today").json()["active_health_flag"] is None
+
+    def test_delete_without_active_flag_is_safe(self, client):
+        assert client.request("DELETE", "/api/health-flag").status_code == 200
+
+
+class TestFeelingsEndpoints:
+    def test_record_and_read_back(self, client):
+        assert client.post("/api/feelings", json={"score": 4, "comment": "smooth"}).status_code == 200
+        body = client.get("/api/feelings").json()
+        assert body["count"] == 1 and body["mean_score"] == 4
+
+    def test_rejects_out_of_range_score(self, client):
+        assert client.post("/api/feelings", json={"score": 9}).status_code == 400
+
+    def test_today_lists_unrated_recent_runs(self, client):
+        body = client.get("/api/today").json()
+        assert "unrated_recent_runs" in body
+
+
+class TestValidationEndpoint:
+    def test_validation_available_standalone_and_inline(self, client):
+        client.get("/api/today")
+        standalone = client.get("/api/plan/validation").json()
+        assert standalone["valid"] is True
+        assert standalone["error_count"] == 0
+        inline = client.get("/api/plan").json()["validation"]
+        assert inline["plan_version"] == standalone["plan_version"]
+
+
+class TestMilestonePushEndpoint:
+    def test_push_half_marathon(self, client):
+        client.get("/api/today")
+        resp = client.post("/api/milestone/push", json={"milestone": "half_marathon", "weeks": 2})
+        assert resp.status_code == 200
+        assert resp.json()["delay_weeks_total"] == 2
+
+    def test_marathon_push_rejected(self, client):
+        client.get("/api/today")
+        assert client.post("/api/milestone/push", json={"milestone": "marathon", "weeks": 2}).status_code == 400
+
+
+class TestDataPipelineEndpoints:
+    def test_backfill_endpoint(self, client):
+        body = client.post("/api/backfill").json()
+        assert body["complete"] is True
+        assert body["new_count"] > 0
+
+    def test_dedupe_dry_run_endpoint(self, client):
+        client.post("/api/sync")
+        body = client.post("/api/dedupe").json()
+        assert body["applied"] is False
+        assert "duplicate_groups" in body
+
+
 class TestStaticFrontend:
     def test_index_served(self, client):
         resp = client.get("/")

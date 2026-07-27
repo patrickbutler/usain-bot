@@ -7,7 +7,7 @@ the same system, not a second implementation of it.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .. import agent
 from ..chat import run_chat_turn
 from ..chat.providers import LLMProviderError, get_llm_provider
 from ..config import Config
@@ -35,6 +36,17 @@ class HealthFlagRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+
+
+class RunFeelingRequest(BaseModel):
+    score: int
+    comment: Optional[str] = None
+    activity_date: Optional[str] = None
+
+
+class PushMilestoneRequest(BaseModel):
+    milestone: str
+    weeks: int
 
 
 def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) -> FastAPI:
@@ -109,7 +121,58 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
         if req.flag not in VALID_HEALTH_FLAGS:
             raise HTTPException(400, f"flag must be one of {VALID_HEALTH_FLAGS}")
         result = service.set_health_flag(req.flag, req.note)
-        return {"applied": True, "today": result.recommendation.to_dict()}
+        return {"applied": True, "active_flag": service.active_health_flag,
+                "today": result.recommendation.to_dict()}
+
+    @app.delete("/api/health-flag")
+    def clear_health_flag():
+        """Undo an active flag (mis-tap, or symptom resolved). The flag
+        stays in history; it just stops constraining today."""
+        result = service.clear_health_flag()
+        return {"cleared": True, "active_flag": None, "today": result.recommendation.to_dict()}
+
+    @app.get("/api/plan/validation")
+    def plan_validation():
+        return service.get_plan_validation()
+
+    @app.get("/api/feelings")
+    def get_feelings(days: int = 14):
+        return service.get_recent_feelings_payload(days=max(1, min(days, 365)))
+
+    @app.post("/api/feelings")
+    def record_feeling(req: RunFeelingRequest):
+        if not 1 <= req.score <= 5:
+            raise HTTPException(400, "score must be between 1 and 5")
+        activity_date = date.fromisoformat(req.activity_date) if req.activity_date else None
+        fb = service.record_run_feeling(req.score, req.comment, activity_date)
+        return {"recorded": True, "score": fb.score}
+
+    @app.post("/api/milestone/push")
+    def push_milestone(req: PushMilestoneRequest):
+        result = service.push_milestone(req.milestone, req.weeks)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return result
+
+    @app.post("/api/backfill")
+    def backfill():
+        """Full-history import. Long-running and rate-limit aware — see
+        agent.backfill_history."""
+        result = agent.backfill_history(config, storage, adapter)
+        return {
+            "new_count": result.new_count, "updated_count": result.updated_count,
+            "chunks_fetched": result.chunks_fetched, "complete": result.complete,
+            "earliest_date": result.earliest_date.isoformat() if result.earliest_date else None,
+            "message": result.message,
+        }
+
+    @app.post("/api/dedupe")
+    def dedupe(apply: bool = False):
+        result = agent.dedupe_activities(storage, apply=apply)
+        return {
+            "duplicate_groups": result.groups, "duplicate_count": result.duplicate_count,
+            "removed": result.removed, "applied": result.applied,
+        }
 
     @app.post("/api/chat")
     def chat(req: ChatRequest):

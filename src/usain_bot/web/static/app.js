@@ -127,10 +127,23 @@
     return "zone-green";
   }
 
+  let activeFlag = null;
+
+  function renderFlagButtons() {
+    ["hip", "back", "fatigue"].forEach((f) => {
+      const btn = $(`#flag-${f}`);
+      const isActive = activeFlag === f;
+      btn.classList.toggle("active", isActive);
+      btn.title = isActive ? `${f} flag active — click to clear it` : `Toggle ${f} flag`;
+    });
+  }
+
   function renderToday(payload) {
     const rec = payload.recommendation;
     const a = payload.anchors;
     const body = $("#today-body");
+    activeFlag = payload.active_health_flag || null;
+    renderFlagButtons();
     const dist = rec.target_distance_mi !== null ? `${rec.target_distance_mi.toFixed(1)} mi` : "—";
     body.innerHTML = `
       <div class="rec-headline">
@@ -145,8 +158,12 @@
       </div>
       <ul class="reasoning-list">${rec.reasoning.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
       <div class="rec-line" style="margin-top:8px"><span class="label">Unlocks more:</span> ${escapeHtml(rec.unlock_next_time)}</div>
+      ${activeFlag ? `<div class="rec-line zone-yellow" style="margin-top:8px">⚑ <strong>${escapeHtml(activeFlag)}</strong> flag is active and capping today. Click the <strong>${escapeHtml(activeFlag)}</strong> button above to clear it.</div>` : ""}
+      ${payload.runs_per_week_actual ? `<div class="rec-line"><span class="label">Actual running frequency:</span> ${payload.runs_per_week_actual} day(s)/week (plan adapts to this)</div>` : ""}
       ${!payload.sync.live ? `<div class="rec-line zone-yellow" style="margin-top:8px">⚠ ${escapeHtml(payload.sync.message)}</div>` : ""}
     `;
+
+    renderUnratedRuns(payload.unrated_recent_runs || []);
 
     const next7 = $("#next7-body");
     next7.innerHTML = payload.next_7_days.map((d) => `
@@ -158,12 +175,86 @@
     `).join("");
   }
 
+  const SCORE_LABELS = { 1: "Awful", 2: "Rough", 3: "Okay", 4: "Good", 5: "Great" };
+
+  function renderUnratedRuns(runs) {
+    const el = $("#feelings-body");
+    const prompt = runs.length
+      ? `<p class="rec-line">Recent runs you haven't rated yet — how did they feel?</p>
+         ${runs.slice(0, 5).map((r) => `
+           <div class="feeling-row" data-date="${r.date}">
+             <span class="day-date">${r.date.slice(5)}</span>
+             <span class="day-type"><span class="cap">${r.run_class}</span> · ${r.distance_mi.toFixed(1)} mi</span>
+             <span class="score-buttons">
+               ${[1, 2, 3, 4, 5].map((s) => `<button class="score-btn" data-date="${r.date}" data-score="${s}" title="${SCORE_LABELS[s]}">${s}</button>`).join("")}
+             </span>
+           </div>`).join("")}`
+      : `<p class="hint-text">All recent runs rated — nice. Log more any time via chat.</p>`;
+    el.innerHTML = prompt + `<div id="feelings-history"></div>`;
+
+    $$(".score-btn", el).forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          await api("/api/feelings", {
+            method: "POST",
+            body: JSON.stringify({ score: Number(btn.dataset.score), activity_date: btn.dataset.date }),
+          });
+        } finally {
+          loadUpcoming();
+        }
+      });
+    });
+    loadFeelingsHistory();
+  }
+
+  async function loadFeelingsHistory() {
+    const el = $("#feelings-history");
+    if (!el) return;
+    try {
+      const data = await api("/api/feelings?days=21");
+      if (!data.count) { el.innerHTML = ""; return; }
+      el.innerHTML = `
+        <p class="rec-line" style="margin-top:12px"><span class="label">Last 21 days:</span>
+          mean ${data.mean_score}/5 across ${data.count} check-in(s)</p>
+        ${data.entries.slice(0, 6).map((e) => `
+          <div class="day-row">
+            <span class="day-date">${(e.activity_date || e.timestamp.slice(0, 10)).slice(5)}</span>
+            <span class="day-type">${SCORE_LABELS[e.score] || e.score} (${e.score}/5)</span>
+            <span class="day-dist">${escapeHtml(e.comment || "")}</span>
+          </div>`).join("")}`;
+    } catch (e) {
+      el.innerHTML = "";
+    }
+  }
+
+  function renderValidation(validation) {
+    const el = $("#validation-body");
+    if (!validation || validation.error) {
+      el.innerHTML = `<p class="loading">${escapeHtml((validation && validation.error) || "unavailable")}</p>`;
+      return;
+    }
+    const badge = validation.valid
+      ? `<span class="valid-badge ok">PASSES</span>`
+      : `<span class="valid-badge bad">${validation.error_count} ERROR(S)</span>`;
+    const issues = (validation.issues || []).map((i) => `
+      <div class="issue-row ${i.severity}">
+        <span class="issue-sev">${i.severity}</span>
+        <span class="issue-msg">${escapeHtml(i.message)}</span>
+      </div>`).join("");
+    el.innerHTML = `
+      <p class="rec-line">${badge} plan v${validation.plan_version} —
+        ${validation.error_count} error(s), ${validation.warning_count} warning(s)</p>
+      ${issues || `<p class="hint-text">All milestone and build-rate checks passed.</p>`}`;
+  }
+
   function renderPlan(plan) {
     const body = $("#plan-body");
     if (plan.error) {
       body.innerHTML = `<p class="loading">${escapeHtml(plan.error)}</p>`;
       return;
     }
+    renderValidation(plan.validation);
     const rows = plan.weeks.map((w) => `
       <tr class="${w.is_backoff ? "backoff" : ""}">
         <td>${w.week_number}</td>
@@ -261,12 +352,18 @@
       await api("/api/today/refresh", { method: "POST" });
       loadUpcoming();
     });
+    // Flags toggle: clicking an already-active flag clears it, so a
+    // mis-tap is undoable without leaving the UI.
     ["hip", "back", "fatigue"].forEach((flag) => {
       $(`#flag-${flag}`).addEventListener("click", async () => {
-        $(`#flag-${flag}`).classList.add("active");
-        $("#today-body").innerHTML = `<p class="loading">Applying ${flag} flag…</p>`;
+        const clearing = activeFlag === flag;
+        $("#today-body").innerHTML = `<p class="loading">${clearing ? `Clearing ${flag} flag…` : `Applying ${flag} flag…`}</p>`;
         try {
-          await api("/api/health-flag", { method: "POST", body: JSON.stringify({ flag }) });
+          if (clearing) {
+            await api("/api/health-flag", { method: "DELETE" });
+          } else {
+            await api("/api/health-flag", { method: "POST", body: JSON.stringify({ flag }) });
+          }
         } finally {
           loadUpcoming();
         }

@@ -14,7 +14,7 @@ from statistics import median
 from typing import Optional
 
 from . import guardrails as gr
-from .classification import RUNNING_CLASSES, classify_activities, compute_anchors
+from .classification import RUNNING_CLASSES, compute_anchors, prepare_classified
 from .config import Config
 from .garmin_adapter.base import GarminAdapter, GarminUnavailableError
 from .models import (
@@ -36,30 +36,175 @@ logger = logging.getLogger("usain_bot.agent")
 FIRST_RUN_LOOKBACK_WEEKS = 12
 HEALTH_FLAG_CAP_FACTOR = 0.85
 
+# Durable athlete choices, persisted outside the plan (which regenerates
+# from anchors every invocation and would otherwise forget them).
+PREF_HM_DELAY_WEEKS = "hm_delay_weeks"
+PREF_ULTRA_DELAY_WEEKS = "ultra_delay_weeks"
+
+# Subjective-state bias: when recent runs have felt bad, cap today below
+# what the physical guardrails alone would allow. 1=awful .. 5=great.
+FEELING_ROUGH_THRESHOLD = 2.5   # mean at/below this => hold at last completed distance
+FEELING_MEH_THRESHOLD = 3.2     # mean at/below this => mild trim
+FEELING_ROUGH_FACTOR = 0.85
+FEELING_MEH_FACTOR = 0.95
+FEELING_LOOKBACK_DAYS = 14
+
+
+def _read_int_preference(storage: StorageBackend, key: str) -> int:
+    raw = storage.get_preference(key)
+    try:
+        return max(0, int(raw)) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
 
 @dataclass
 class SyncResult:
-    activities_count: int
+    activities_count: int          # newly inserted
     live: bool
     message: str
+    updated_count: int = 0         # existing rows corrected (edited on Garmin)
 
 
-def sync_activities(storage: StorageBackend, adapter: GarminAdapter, as_of: date, lookback_weeks: int = FIRST_RUN_LOOKBACK_WEEKS) -> SyncResult:
-    """Pull anything newer than the last successful sync. Degrades
-    gracefully if Garmin is unreachable: use cached data, say so, bias
-    conservative (the caller does the biasing via gap/ACWR guardrails
-    naturally seeing less-recent data)."""
+def sync_activities(
+    storage: StorageBackend,
+    adapter: GarminAdapter,
+    as_of: date,
+    lookback_weeks: int = FIRST_RUN_LOOKBACK_WEEKS,
+    overlap_days: int = 30,
+) -> SyncResult:
+    """Incremental sync. Always re-pulls a trailing *overlap window* (not
+    just "everything since last sync") so activities the athlete edited
+    on Garmin after they were first synced get their corrections picked
+    up — storage.save_activities upserts, so a changed distance/duration/
+    name updates the existing row instead of being ignored as a dupe.
+
+    Degrades gracefully if Garmin is unreachable: use cached data, say
+    so, bias conservative (the gap/ACWR guardrails do that naturally
+    once they see less-recent data)."""
     last_sync = storage.get_last_sync_time()
-    start = last_sync.date() if last_sync else as_of - timedelta(weeks=lookback_weeks)
+    if last_sync:
+        start = min(last_sync.date(), as_of) - timedelta(days=overlap_days)
+    else:
+        start = as_of - timedelta(weeks=lookback_weeks)
 
     try:
         fresh = adapter.fetch_activities(start, as_of)
-        new_count = storage.save_activities(fresh)
+        new_count, updated_count = storage.save_activities(fresh)
         storage.set_last_sync_time(datetime.utcnow())
-        return SyncResult(new_count, True, f"Synced Garmin: {new_count} new activities ({start} to {as_of}).")
+        msg = f"Synced Garmin: {new_count} new, {updated_count} updated ({start} to {as_of})."
+        return SyncResult(new_count, True, msg, updated_count)
     except GarminUnavailableError as exc:
         logger.warning("Garmin unreachable, falling back to cache: %s", exc)
         return SyncResult(0, False, f"Garmin unreachable ({exc}). Using cached data — recommendation biased conservative.")
+
+
+@dataclass
+class BackfillResult:
+    new_count: int
+    updated_count: int
+    chunks_fetched: int
+    earliest_date: Optional[date]
+    complete: bool
+    message: str
+
+
+def backfill_history(
+    config: Config,
+    storage: StorageBackend,
+    adapter: GarminAdapter,
+    as_of: Optional[date] = None,
+    max_years: int = 15,
+    sleep_fn=None,
+) -> BackfillResult:
+    """One-time full-history pull, walking backwards in chunks.
+
+    Garmin rate-limits aggressively (a single wide request is what
+    returned 429), so this requests a bounded window at a time and pauses
+    between chunks; the adapter itself additionally retries with long
+    backoff on 429. Stops after `backfill_max_empty_chunks` consecutive
+    empty windows (assumed past the start of history) or `max_years`.
+
+    Safe to re-run: save_activities upserts, so re-pulled activities are
+    deduped by activity_id rather than duplicated."""
+    import time
+
+    sleep_fn = sleep_fn or time.sleep
+    as_of = as_of or date.today()
+    chunk_days = config.sync.backfill_chunk_days
+    pause = config.sync.backfill_pause_s
+    max_empty = config.sync.backfill_max_empty_chunks
+
+    total_new = total_updated = chunks = 0
+    empty_streak = 0
+    earliest_seen: Optional[date] = None
+    window_end = as_of
+    hard_floor = as_of - timedelta(days=365 * max_years)
+
+    while window_end > hard_floor:
+        window_start = window_end - timedelta(days=chunk_days)
+        try:
+            fetched = adapter.fetch_activities(window_start, window_end)
+        except GarminUnavailableError as exc:
+            return BackfillResult(
+                total_new, total_updated, chunks, earliest_seen, False,
+                f"Backfill stopped early after {chunks} chunk(s): {exc}. "
+                f"Imported {total_new} new / {total_updated} updated so far — safe to re-run to resume.",
+            )
+
+        chunks += 1
+        if fetched:
+            new_c, upd_c = storage.save_activities(fetched)
+            total_new += new_c
+            total_updated += upd_c
+            oldest = min(a.date for a in fetched)
+            earliest_seen = oldest if earliest_seen is None else min(earliest_seen, oldest)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= max_empty:
+                break
+
+        window_end = window_start - timedelta(days=1)
+        if pause:
+            sleep_fn(pause)
+
+    storage.set_last_sync_time(datetime.utcnow())
+    return BackfillResult(
+        total_new, total_updated, chunks, earliest_seen, True,
+        f"Backfill complete: {total_new} new, {total_updated} updated across {chunks} chunk(s)"
+        + (f", earliest activity {earliest_seen.isoformat()}." if earliest_seen else " (no activities found)."),
+    )
+
+
+@dataclass
+class DedupeResult:
+    groups: list[list[str]]      # activity_id groups that look like the same run
+    removed: list[str]
+    applied: bool
+
+    @property
+    def duplicate_count(self) -> int:
+        return sum(len(g) - 1 for g in self.groups)
+
+
+def dedupe_activities(storage: StorageBackend, apply: bool = False) -> DedupeResult:
+    """Find (and optionally remove) genuine storage duplicates: the same
+    physical run stored under multiple Garmin activity IDs. The richest
+    record in each group is kept.
+
+    Not to be confused with split-run merging (sessions.py) — a run split
+    across two *deliberate* recordings 20 minutes apart is two real
+    activities that get merged at read time, not duplicates to delete."""
+    groups = storage.find_duplicate_activity_groups()
+    id_groups = [[a.activity_id for a in g] for g in groups]
+    removed: list[str] = []
+    if apply:
+        for group in groups:
+            losers = [a.activity_id for a in group[1:]]  # group[0] is the keeper
+            storage.delete_activities(losers)
+            removed.extend(losers)
+    return DedupeResult(id_groups, removed, apply)
 
 
 def _week_start(d: date) -> date:
@@ -202,6 +347,16 @@ def compute_recommendation(
             f"Health flag active: capped below last completed distance as a precaution.",
         ))
 
+    # Subjective state: how recent runs actually FELT is a real signal the
+    # physical anchors can't see. Deterministic (not left to the LLM):
+    # a rough recent average caps today below what load math alone allows.
+    feeling_guardrail = _feeling_guardrail(storage, classified, anchors, as_of, run_type)
+    if feeling_guardrail is not None:
+        candidates.append(feeling_guardrail)
+        conflicts.append(
+            "Recent runs have been feeling rough — that conservative signal is applied on top of the load math."
+        )
+
     guardrail_results = candidates
     binding = min(
         (g for g in guardrail_results if g.max_value is not None),
@@ -240,6 +395,40 @@ def compute_recommendation(
     )
 
 
+def _feeling_guardrail(
+    storage: StorageBackend,
+    classified: list[ClassifiedActivity],
+    anchors: Anchors,
+    as_of: date,
+    run_type: str,
+) -> Optional[GuardrailResult]:
+    """Turn recent run-feeling scores into a hard ceiling candidate.
+    Returns None when there's no recent feedback or it's been fine."""
+    feedback = storage.get_recent_run_feedback(days=FEELING_LOOKBACK_DAYS)
+    if not feedback:
+        return None
+    mean_score = sum(f.score for f in feedback) / len(feedback)
+    if mean_score > FEELING_MEH_THRESHOLD:
+        return None
+
+    base = anchors.long_run_anchor_mi if run_type == "long" else _recent_easy_distance(
+        classified, as_of, fallback=anchors.chronic_load_mi / 3 if anchors.chronic_load_mi else 3.0
+    )
+    if base <= 0:
+        return None
+
+    if mean_score <= FEELING_ROUGH_THRESHOLD:
+        factor, label = FEELING_ROUGH_FACTOR, "rough"
+    else:
+        factor, label = FEELING_MEH_FACTOR, "below par"
+
+    return GuardrailResult(
+        "recent_run_feeling", base * factor,
+        f"Recent runs reported feeling {label} (mean {mean_score:.1f}/5 across {len(feedback)} "
+        f"check-in(s), trailing {FEELING_LOOKBACK_DAYS}d): holding at/below last completed distance.",
+    )
+
+
 def _effort_guidance(run_type: str, zone: gr.ACWRZone) -> str:
     if run_type == "long":
         return "Conversational, aerobic effort throughout. Walk breaks are fine, especially beyond mile 10."
@@ -261,6 +450,8 @@ def _unlock_message(binding: GuardrailResult, anchors: Anchors, zone: gr.ACWRZon
         return "Raising this week's overall volume (while staying under the weekly cap) would raise the 35% long-run ceiling too."
     if binding.name == "backoff_week":
         return "This is a scheduled back-off week — next week resumes normal progression."
+    if binding.name == "recent_run_feeling":
+        return "A couple of runs that feel good again will lift this cap — tell the coach how each one went."
     return "Consistent, injury-free weeks are what unlock the next increment."
 
 
@@ -307,9 +498,9 @@ def run_invocation(
     """§4.3 steps 1-8, end to end."""
     as_of = as_of or date.today()
 
-    sync = sync_activities(storage, adapter, as_of)
+    sync = sync_activities(storage, adapter, as_of, overlap_days=config.sync.overlap_days)
     activities = storage.get_activities()
-    classified = classify_activities(activities)
+    classified = prepare_classified(activities, config.sync.merge_gap_hours)
 
     planned_runs_14d = config.athlete.available_run_days_per_week * 2
     anchors = compute_anchors(classified, as_of, planned_runs_trailing_14d=planned_runs_14d)
@@ -320,23 +511,39 @@ def run_invocation(
     prior_plan = storage.get_latest_plan_version()
     next_version = (prior_plan.version + 1) if prior_plan else 1
 
+    # Athlete-requested milestone pushes persist across regenerations
+    # (the plan itself is regenerated from anchors every invocation, so
+    # anything meant to stick has to live outside the plan).
+    hm_delay = _read_int_preference(storage, PREF_HM_DELAY_WEEKS)
+    ultra_delay = _read_int_preference(storage, PREF_ULTRA_DELAY_WEEKS)
+    run_days = anchors.runs_per_week or config.athlete.available_run_days_per_week
+
+    plan_kwargs = dict(hm_delay_weeks=hm_delay, ultra_delay_weeks=ultra_delay, run_days_per_week=run_days)
+
     if action.regenerate_plan:
         trigger = "gap_regeneration"
         rationale = f"Gap of {gap.gap_days} days exceeds 6 weeks: {action.description}"
         rationale += _cited_reference_note(storage, "return to running after long break detraining")
-        plan = generate_macro_plan(config, anchors, as_of, next_version, trigger, rationale)
+        plan = generate_macro_plan(config, anchors, as_of, next_version, trigger, rationale, **plan_kwargs)
     else:
         trigger = "scheduled_reprojection" if gap.severity == GapSeverity.SHORT else "gap_detected"
         rationale = (
             "Rolling re-projection from current anchors." if gap.severity == GapSeverity.SHORT
             else f"Gap of {gap.gap_days} days ({gap.severity.value}): {action.description}"
         )
+        if anchors.runs_per_week and anchors.runs_per_week != config.athlete.available_run_days_per_week:
+            rationale += (
+                f" Running frequency derived from actuals: {anchors.runs_per_week} day(s)/week "
+                f"(config says {config.athlete.available_run_days_per_week}) — plan adapted to what's "
+                "actually being run."
+            )
         if gap.severity != GapSeverity.SHORT:
             rationale += _cited_reference_note(storage, "return to running after a break gap protocol")
         plan = generate_macro_plan(
             config, anchors, as_of, next_version, trigger, rationale,
             gap_hold_weeks=action.backtrack_weeks,
             gap_easy_only=action.easy_only,
+            **plan_kwargs,
         )
 
     if health_flag:
@@ -376,9 +583,10 @@ def first_run_report(config: Config, storage: StorageBackend, adapter: GarminAda
     macro plan, and list open uncertainties. Does NOT persist plan v1 —
     that happens only after the athlete confirms (see confirm_first_run)."""
     as_of = as_of or date.today()
-    sync = sync_activities(storage, adapter, as_of, lookback_weeks=FIRST_RUN_LOOKBACK_WEEKS)
+    sync = sync_activities(storage, adapter, as_of, lookback_weeks=FIRST_RUN_LOOKBACK_WEEKS,
+                            overlap_days=config.sync.overlap_days)
     activities = storage.get_activities()
-    classified = classify_activities(activities)
+    classified = prepare_classified(activities, config.sync.merge_gap_hours)
     anchors = compute_anchors(classified, as_of, planned_runs_trailing_14d=config.athlete.available_run_days_per_week * 2)
 
     baseline_conflict = None
@@ -432,7 +640,7 @@ def override_plan(config: Config, storage: StorageBackend, text: str, as_of: Opt
         return OverrideResult(None, False, "", ["No existing plan to override — run `usain-bot init` first."])
 
     activities = storage.get_activities()
-    classified = classify_activities(activities)
+    classified = prepare_classified(activities, config.sync.merge_gap_hours)
     anchors = compute_anchors(classified, as_of, planned_runs_trailing_14d=config.athlete.available_run_days_per_week * 2)
 
     storage.save_conversation_entry(ConversationEntry(
