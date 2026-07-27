@@ -84,8 +84,12 @@ def tool_shift_marathon_date(service: CoachService, input: dict) -> dict:
     if plan is None:
         return {"error": "No plan exists yet."}
     weeks = int(input["weeks"])
-    today = service.get_today()
-    result = planner.shift_marathon(plan, service.config, today.anchors, date.today(), weeks, "requested via chat")
+    # Read-only anchors, not get_today(): get_today() can persist a new
+    # plan version as a side effect if its cache is stale, which would
+    # race with the version number this function is about to compute
+    # from `plan` above.
+    anchors = service.get_current_anchors()
+    result = planner.shift_marathon(plan, service.config, anchors, date.today(), weeks, "requested via chat")
     return _apply_override_result(service, result)
 
 

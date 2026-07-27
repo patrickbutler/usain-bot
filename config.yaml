@@ -49,6 +49,6 @@ storage:
     references_dir: references
 
 chat:
-  provider: anthropic              # only provider implemented today — see chat/providers/
-  model: claude-sonnet-5
+  provider: openai                 # "openai" (default) | "anthropic" — see chat/providers/
+  model: gpt-4o
   max_tokens: 1536

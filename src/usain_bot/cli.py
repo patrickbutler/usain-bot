@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import agent
+from .chat.providers import get_required_env_var
 from .config import Config, GarminCredentials, load_config
 from .garmin_adapter.base import GarminAdapter
 from .garmin_adapter.live import GarminConnectAdapter
@@ -259,8 +260,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     app = create_app(config, storage, adapter_)
 
     print(f"usain-bot web UI at http://{args.host}:{args.port}")
-    if config.chat.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[!] ANTHROPIC_API_KEY not set — every tab except Chat will still work.")
+    required_var = get_required_env_var(config.chat.provider)
+    if required_var and not os.environ.get(required_var):
+        print(f"[!] {required_var} not set for chat provider '{config.chat.provider}' — every tab except Chat will still work.")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info" if args.verbose else "warning")
     return 0
 

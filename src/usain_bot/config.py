@@ -69,8 +69,8 @@ class StorageConfig:
 
 @dataclass
 class ChatConfig:
-    provider: str = "anthropic"
-    model: str = "claude-sonnet-5"
+    provider: str = "openai"
+    model: str = "gpt-4o"
     max_tokens: int = 1536
 
 
@@ -112,8 +112,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH, env_path: Optional[str |
 
     chat_raw = raw.get("chat", {})
     chat = ChatConfig(
-        provider=os.environ.get("USAIN_BOT_CHAT_PROVIDER", chat_raw.get("provider", "anthropic")),
-        model=os.environ.get("USAIN_BOT_CHAT_MODEL", chat_raw.get("model", "claude-sonnet-5")),
+        provider=os.environ.get("USAIN_BOT_CHAT_PROVIDER", chat_raw.get("provider", "openai")),
+        model=os.environ.get("USAIN_BOT_CHAT_MODEL", chat_raw.get("model", "gpt-4o")),
         max_tokens=int(chat_raw.get("max_tokens", 1536)),
     )
 

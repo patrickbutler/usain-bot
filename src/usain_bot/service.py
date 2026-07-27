@@ -19,10 +19,10 @@ from typing import Optional
 
 from . import agent
 from . import planner
-from .classification import classify_activities
+from .classification import classify_activities, compute_anchors
 from .config import Config
 from .garmin_adapter.base import GarminAdapter
-from .models import ClassifiedActivity, HealthFlag, PlanVersion
+from .models import Anchors, ClassifiedActivity, HealthFlag, PlanVersion
 from .projection import project_next_7_days
 from .storage.base import StorageBackend
 
@@ -160,6 +160,21 @@ class CoachService:
             })
         entries.reverse()  # newest first
         return {"versions": entries}
+
+    def get_current_anchors(self, as_of: Optional[date] = None) -> Anchors:
+        """Read-only anchors (classify stored activities, compute load) —
+        no plan regeneration, no persistence. Use this instead of
+        get_today()/refresh_today() whenever a caller just needs anchors
+        (e.g. to feed a plan mutation like shift_marathon) rather than a
+        full "today" recommendation; get_today() runs the whole decision
+        procedure and can persist a new plan version as a side effect,
+        which would race with a caller that already fetched a plan
+        version and is about to save its own edit to it."""
+        as_of = as_of or date.today()
+        activities = self.storage.get_activities()
+        classified = classify_activities(activities)
+        planned_runs_14d = self.config.athlete.available_run_days_per_week * 2
+        return compute_anchors(classified, as_of, planned_runs_trailing_14d=planned_runs_14d)
 
     def get_history(self, days: int = 90) -> list[ClassifiedActivity]:
         activities = self.storage.get_activities()

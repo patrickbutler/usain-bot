@@ -28,7 +28,7 @@ src/usain_bot/
   projection.py             shared "next 7 days" rolling view (CLI + web)
   cli.py                    `usain-bot` entrypoint
   chat/
-    providers/               LLMProvider interface + AnthropicProvider (swap vendors here)
+    providers/               LLMProvider interface + OpenAIProvider (default) + AnthropicProvider
     tools.py                 tool definitions the LLM calls — dispatches into agent/planner
     session.py                provider-agnostic tool-calling loop
   web/
@@ -51,7 +51,7 @@ touching reasoning code.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"       # CLI only
-pip install -e ".[dev,chat]"  # + the web UI's Chat tab (adds the anthropic SDK)
+pip install -e ".[dev,chat]"  # + the web UI's Chat tab (adds both the openai and anthropic SDKs)
 ```
 
 Copy `.env.example` to `.env` and fill in your Garmin credentials:
@@ -146,9 +146,24 @@ Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, buil
 - **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override), expandable to see exactly which weeks changed and how.
 - **History** — a weekly volume chart and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
 
-Chat needs `ANTHROPIC_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
+Chat defaults to **OpenAI (ChatGPT)** and needs `OPENAI_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
 
-**Swapping the LLM provider:** `chat/providers/base.py` defines a small provider-agnostic interface (`LLMProvider`, plus normalized `ChatMessage`/`ToolSpec`/`ProviderResponse` types) that `chat/session.py`'s orchestration loop and `chat/tools.py`'s tool definitions depend on — never on the Anthropic SDK directly. To add another vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py`, and set `chat.provider` in `config.yaml` (or `USAIN_BOT_CHAT_PROVIDER`). Nothing else changes.
+**Swapping the LLM provider:** `chat/providers/base.py` defines a small provider-agnostic interface (`LLMProvider`, plus normalized `ChatMessage`/`ToolSpec`/`ProviderResponse` types) that `chat/session.py`'s orchestration loop and `chat/tools.py`'s tool definitions depend on — never on a concrete vendor SDK. Two providers ship today:
+
+| Provider | `chat.provider` value | Model default | Required env var |
+|---|---|---|---|
+| OpenAI (default) | `openai` | `gpt-4o` | `OPENAI_API_KEY` |
+| Anthropic | `anthropic` | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
+
+Switch by setting in `config.yaml`:
+
+```yaml
+chat:
+  provider: anthropic
+  model: claude-sonnet-5
+```
+
+or via environment variables (`USAIN_BOT_CHAT_PROVIDER=anthropic`, `USAIN_BOT_CHAT_MODEL=claude-sonnet-5`) without touching the file. To add a third vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py` (and one line to its `REQUIRED_ENV_VAR` map so `usain-bot serve`'s startup warning knows which key to check for). Nothing in `chat/session.py`, `chat/tools.py`, or `web/app.py` changes — that's the whole point of the abstraction, and `tests/test_chat_providers.py` exercises both shipped providers' request/response translation directly (mocked SDK calls, no network) to prove it holds up in practice, not just on paper.
 
 ## Reference articles
 
@@ -227,16 +242,19 @@ No changes are needed anywhere else — `agent.py`, `planner.py`, and
 pytest
 ```
 
-146+ tests, all network-free — including chat, which is tested against a
-scripted fake `LLMProvider` (`tests/test_chat_session.py`), never the
-real Anthropic API. `guardrails.py` functions are pure and unit-tested
-directly, including edge cases (zero chronic load, a >6-week gap, a long
-run exceeding 35% of weekly volume, ACWR undefined at cold start).
-`MockGarminAdapter` reads `tests/fixtures/mock_activities.json` so
-`classification.py`, `planner.py`, the full `agent.py` decision
-procedure, the REST API (`tests/test_web_api.py`, via FastAPI's
-`TestClient`), and the chat tool dispatch (`tests/test_chat_tools.py`)
-are all exercised end to end without a Garmin account or an API key.
+169+ tests, all network-free — including chat, which is tested at two
+levels without ever calling a real LLM API: the orchestration loop
+against a scripted fake `LLMProvider` (`tests/test_chat_session.py`),
+and each shipped provider's actual request/response translation against
+a mocked SDK client (`tests/test_chat_providers.py`). `guardrails.py`
+functions are pure and unit-tested directly, including edge cases (zero
+chronic load, a >6-week gap, a long run exceeding 35% of weekly volume,
+ACWR undefined at cold start). `MockGarminAdapter` reads
+`tests/fixtures/mock_activities.json` so `classification.py`,
+`planner.py`, the full `agent.py` decision procedure, the REST API
+(`tests/test_web_api.py`, via FastAPI's `TestClient`), and the chat tool
+dispatch (`tests/test_chat_tools.py`) are all exercised end to end
+without a Garmin account or an API key.
 
 ## Design notes worth knowing
 

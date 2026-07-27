@@ -136,7 +136,15 @@ class TestHealthFlagEndpoint:
 
 class TestChatEndpointWithoutApiKey:
     def test_chat_fails_gracefully_without_api_key(self, client, monkeypatch):
+        # default provider is openai; OPENAI_API_KEY missing should fail cleanly
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        resp = client.post("/api/chat", json={"message": "what should I run today"})
+        assert resp.status_code == 503
+        assert "OPENAI_API_KEY" in resp.json()["detail"]
+
+    def test_chat_fails_gracefully_for_anthropic_provider_too(self, client, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        client.app.state.config.chat.provider = "anthropic"
         resp = client.post("/api/chat", json={"message": "what should I run today"})
         assert resp.status_code == 503
         assert "ANTHROPIC_API_KEY" in resp.json()["detail"]
