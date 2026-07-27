@@ -3,11 +3,11 @@
 Mirrors the StorageBackend/GarminAdapter pattern used elsewhere: the
 orchestration loop (chat/session.py) and tool dispatch (chat/tools.py)
 only ever depend on `LLMProvider` and these normalized dataclasses,
-never on a concrete SDK. OpenAI (openai_provider.py) is the default,
-Anthropic (anthropic_provider.py) is a swappable alternate — adding
-another vendor means adding one new file under chat/providers/ and a
-factory entry — nothing in the orchestration loop, tool definitions, or
-web/chat layer changes.
+never on a concrete SDK. OpenAI (openai_provider.py) is the default;
+Gemini (gemini_provider.py) and Anthropic (anthropic_provider.py) are
+swappable alternates — adding another vendor means adding one new file
+under chat/providers/ and a factory entry — nothing in the
+orchestration loop, tool definitions, or web/chat layer changes.
 """
 
 from __future__ import annotations

@@ -28,7 +28,7 @@ src/usain_bot/
   projection.py             shared "next 7 days" rolling view (CLI + web)
   cli.py                    `usain-bot` entrypoint
   chat/
-    providers/               LLMProvider interface + OpenAIProvider (default) + AnthropicProvider
+    providers/               LLMProvider interface + OpenAIProvider (default) + GeminiProvider + AnthropicProvider
     tools.py                 tool definitions the LLM calls — dispatches into agent/planner
     session.py                provider-agnostic tool-calling loop
   web/
@@ -51,7 +51,7 @@ touching reasoning code.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"       # CLI only
-pip install -e ".[dev,chat]"  # + the web UI's Chat tab (adds both the openai and anthropic SDKs)
+pip install -e ".[dev,chat]"  # + the web UI's Chat tab (adds the openai, google-genai, and anthropic SDKs)
 ```
 
 Copy `.env.example` to `.env` and fill in your Garmin credentials:
@@ -148,22 +148,25 @@ Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, buil
 
 Chat defaults to **OpenAI (ChatGPT)** and needs `OPENAI_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
 
-**Swapping the LLM provider:** `chat/providers/base.py` defines a small provider-agnostic interface (`LLMProvider`, plus normalized `ChatMessage`/`ToolSpec`/`ProviderResponse` types) that `chat/session.py`'s orchestration loop and `chat/tools.py`'s tool definitions depend on — never on a concrete vendor SDK. Two providers ship today:
+**Swapping the LLM provider:** `chat/providers/base.py` defines a small provider-agnostic interface (`LLMProvider`, plus normalized `ChatMessage`/`ToolSpec`/`ProviderResponse` types) that `chat/session.py`'s orchestration loop and `chat/tools.py`'s tool definitions depend on — never on a concrete vendor SDK. Three providers ship today, each with a meaningfully different wire format underneath the same interface (OpenAI keys tool results on an opaque call id via `role: "tool"` messages; Anthropic nests them as content blocks in a `role: "user"` message; Gemini keys them on the function *name* via `role: "model"`/`"user"` content parts) — proof the abstraction holds in practice, not just on paper:
 
 | Provider | `chat.provider` value | Model default | Required env var |
 |---|---|---|---|
 | OpenAI (default) | `openai` | `gpt-4o` | `OPENAI_API_KEY` |
+| Gemini | `gemini` | `gemini-2.0-flash` | `GEMINI_API_KEY` |
 | Anthropic | `anthropic` | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
 
-Switch by setting in `config.yaml`:
+None of the three are required unless you select them — `usain-bot serve` runs fine with zero LLM API keys set; only the Chat tab needs one, for whichever provider is configured.
+
+Switch by setting in `config.yaml` (`provider` and `model` are paired — always set both together):
 
 ```yaml
 chat:
-  provider: anthropic
-  model: claude-sonnet-5
+  provider: gemini
+  model: gemini-2.0-flash
 ```
 
-or via environment variables (`USAIN_BOT_CHAT_PROVIDER=anthropic`, `USAIN_BOT_CHAT_MODEL=claude-sonnet-5`) without touching the file. To add a third vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py` (and one line to its `REQUIRED_ENV_VAR` map so `usain-bot serve`'s startup warning knows which key to check for). Nothing in `chat/session.py`, `chat/tools.py`, or `web/app.py` changes — that's the whole point of the abstraction, and `tests/test_chat_providers.py` exercises both shipped providers' request/response translation directly (mocked SDK calls, no network) to prove it holds up in practice, not just on paper.
+or via environment variables (`USAIN_BOT_CHAT_PROVIDER=gemini`, `USAIN_BOT_CHAT_MODEL=gemini-2.0-flash`) without touching the file — see the alternate blocks in `.env.example`. To add a fourth vendor: write `chat/providers/<vendor>.py` implementing `LLMProvider`, add one branch to `chat/providers/factory.py` (and one line to its `REQUIRED_ENV_VAR` map so `usain-bot serve`'s startup warning knows which key to check for). Nothing in `chat/session.py`, `chat/tools.py`, or `web/app.py` changes — and `tests/test_chat_providers.py` / `tests/test_chat_providers_gemini.py` exercise every shipped provider's request/response translation directly (mocked SDK calls, no network — none of this has been tested against a live API key in this environment).
 
 ## Reference articles
 
@@ -242,11 +245,12 @@ No changes are needed anywhere else — `agent.py`, `planner.py`, and
 pytest
 ```
 
-169+ tests, all network-free — including chat, which is tested at two
+186+ tests, all network-free — including chat, which is tested at two
 levels without ever calling a real LLM API: the orchestration loop
 against a scripted fake `LLMProvider` (`tests/test_chat_session.py`),
 and each shipped provider's actual request/response translation against
-a mocked SDK client (`tests/test_chat_providers.py`). `guardrails.py`
+a mocked SDK client (`tests/test_chat_providers.py`,
+`tests/test_chat_providers_gemini.py`). `guardrails.py`
 functions are pure and unit-tested directly, including edge cases (zero
 chronic load, a >6-week gap, a long run exceeding 35% of weekly volume,
 ACWR undefined at cold start). `MockGarminAdapter` reads

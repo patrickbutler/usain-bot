@@ -17,6 +17,7 @@ from .base import LLMProvider
 REQUIRED_ENV_VAR: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
 }
 
 
@@ -33,7 +34,12 @@ def get_llm_provider(config: Config) -> LLMProvider:
 
         return AnthropicProvider.from_env(model=config.chat.model, max_tokens=config.chat.max_tokens)
 
-    raise ValueError(f"Unknown chat provider: {provider!r} (expected 'openai' or 'anthropic')")
+    if provider == "gemini":
+        from .gemini_provider import GeminiProvider
+
+        return GeminiProvider.from_env(model=config.chat.model, max_tokens=config.chat.max_tokens)
+
+    raise ValueError(f"Unknown chat provider: {provider!r} (expected 'openai', 'anthropic', or 'gemini')")
 
 
 def get_required_env_var(provider: str) -> str:
