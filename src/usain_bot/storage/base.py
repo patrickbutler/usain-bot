@@ -21,19 +21,36 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional
 
-from ..models import Activity, ConversationEntry, HealthFlag, PlanVersion, ReferenceChunk, ReferenceDoc
+from ..models import (
+    Activity,
+    ConversationEntry,
+    HealthFlag,
+    PlanVersion,
+    ReferenceChunk,
+    ReferenceDoc,
+    RunFeedback,
+)
 
 
 class StorageBackend(ABC):
     # --- activities ---------------------------------------------------------
 
     @abstractmethod
-    def save_activities(self, activities: list[Activity]) -> int:
-        """Insert new activities, deduped by activity_id. Returns count of new rows."""
+    def save_activities(self, activities: list[Activity]) -> tuple[int, int]:
+        """Upsert activities keyed on activity_id. New rows are inserted;
+        existing rows whose material fields (distance, duration, name, HR,
+        start time) differ are updated in place — this is how edited Garmin
+        activities inside the sync overlap window get corrected. Returns
+        (new_count, updated_count)."""
 
     @abstractmethod
     def get_activities(self, since: Optional[datetime] = None) -> list[Activity]:
         """All stored activities, optionally filtered to those on/after `since`."""
+
+
+    @abstractmethod
+    def delete_activities(self, activity_ids: list[str]) -> int:
+        """Remove specific rows (used by dedupe resolution). Returns count deleted."""
 
     @abstractmethod
     def get_last_sync_time(self) -> Optional[datetime]:
@@ -42,6 +59,26 @@ class StorageBackend(ABC):
     @abstractmethod
     def set_last_sync_time(self, ts: datetime) -> None:
         ...
+
+    # --- preferences (durable user choices that survive plan regeneration) ---
+
+    @abstractmethod
+    def get_preference(self, key: str) -> Optional[str]:
+        ...
+
+    @abstractmethod
+    def set_preference(self, key: str, value: str) -> None:
+        ...
+
+    # --- run feedback (how runs felt — the coach's subjective-state memory) ---
+
+    @abstractmethod
+    def save_run_feedback(self, feedback: RunFeedback) -> None:
+        ...
+
+    @abstractmethod
+    def get_recent_run_feedback(self, days: int = 14, limit: int = 20) -> list[RunFeedback]:
+        """Most recent first."""
 
     # --- plan_versions --------------------------------------------------------
 

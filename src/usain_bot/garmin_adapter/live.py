@@ -4,15 +4,26 @@ config.GarminCredentials.from_env) — never hardcode credentials.
 
 Session tokens are cached to disk (GARMINTOKENS) so most invocations
 don't need to re-authenticate, which matters because Garmin rate-limits
-and occasionally changes endpoints. Any failure here is translated to
-GarminUnavailableError so the agent can degrade gracefully instead of
-crashing mid-run.
+and occasionally changes endpoints.
+
+Scope: per product decision, only running activities are pulled —
+activityType.typeKey in {running, trail_running, treadmill_running}
+("treadmill" is also accepted in case Garmin's key varies). Everything
+else (cycling, strength, ...) is excluded at this boundary.
+
+Rate limiting: every fetch retries with exponential backoff. A response
+that looks like HTTP 429 (rate limited) gets a much longer backoff
+schedule than a generic transient failure, since Garmin's limiter needs
+real cool-down time — this is what the initial full-history backfill
+relies on. Any terminal failure is translated to GarminUnavailableError
+so the agent can degrade gracefully instead of crashing mid-run.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
+import time
+from datetime import date, datetime
 
 from ..config import GarminCredentials
 from ..models import Activity, ActivityType
@@ -22,22 +33,28 @@ logger = logging.getLogger(__name__)
 
 _METERS_PER_MILE = 1609.344
 
-_TYPE_KEY_MAP = {
-    "running": ActivityType.RUNNING,
-    "trail_running": ActivityType.RUNNING,
-    "track_running": ActivityType.RUNNING,
-    "treadmill_running": ActivityType.RUNNING,
-    "street_running": ActivityType.RUNNING,
-    "cycling": ActivityType.CYCLING,
-    "road_biking": ActivityType.CYCLING,
-    "mountain_biking": ActivityType.CYCLING,
-    "indoor_cycling": ActivityType.CYCLING,
-    "strength_training": ActivityType.STRENGTH_TRAINING,
-}
+# Only these activityType.typeKey values are running activities we keep.
+INCLUDED_TYPE_KEYS = {"running", "trail_running", "treadmill_running", "treadmill"}
+
+# Backoff schedules (seconds). Rate-limit (429) responses need long
+# cool-downs; other transient failures retry quickly.
+RATE_LIMIT_BACKOFF_S = (30.0, 60.0, 120.0, 240.0)
+TRANSIENT_BACKOFF_S = (2.0, 4.0, 8.0, 16.0)
 
 
-def _map_activity_type(type_key: str | None) -> ActivityType:
-    return _TYPE_KEY_MAP.get((type_key or "").lower(), ActivityType.OTHER)
+def _is_rate_limited(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+def _parse_start_time(raw: dict) -> datetime | None:
+    start = raw.get("startTimeLocal") or raw.get("startTimeGMT")
+    if not start:
+        return None
+    try:
+        return datetime.fromisoformat(start.replace("T", " ").strip())
+    except ValueError:
+        return None
 
 
 def _normalize(raw: dict) -> Activity:
@@ -46,15 +63,13 @@ def _normalize(raw: dict) -> Activity:
     distance_mi = distance_m / _METERS_PER_MILE
     avg_pace = (duration_s / 60.0 / distance_mi) if distance_mi > 0 else None
 
-    start = raw.get("startTimeLocal") or raw.get("startTimeGMT") or ""
-    activity_date = date.fromisoformat(start[:10]) if start else date.today()
-
-    type_key = (raw.get("activityType") or {}).get("typeKey")
+    start_time = _parse_start_time(raw)
+    activity_date = start_time.date() if start_time else date.today()
 
     return Activity(
         activity_id=str(raw.get("activityId")),
         date=activity_date,
-        activity_type=_map_activity_type(type_key),
+        activity_type=ActivityType.RUNNING,
         distance_mi=distance_mi,
         duration_s=duration_s,
         avg_pace_min_per_mi=avg_pace,
@@ -62,14 +77,16 @@ def _normalize(raw: dict) -> Activity:
         max_hr=raw.get("maxHR"),
         elevation_gain_ft=(raw.get("elevationGain") or 0.0) * 3.28084 if raw.get("elevationGain") else None,
         name=raw.get("activityName"),
+        start_time=start_time,
         raw=raw,
     )
 
 
 class GarminConnectAdapter(GarminAdapter):
-    def __init__(self, credentials: GarminCredentials):
+    def __init__(self, credentials: GarminCredentials, sleep_fn=time.sleep):
         self._credentials = credentials
         self._client = None
+        self._sleep = sleep_fn  # injectable for tests
 
     def _ensure_client(self):
         if self._client is not None:
@@ -96,17 +113,36 @@ class GarminConnectAdapter(GarminAdapter):
         self._client = client
         return client
 
-    def fetch_activities(self, start_date: date, end_date: date) -> list[Activity]:
+    def _fetch_with_retries(self, start_date: date, end_date: date) -> list[dict]:
         client = self._ensure_client()
-        try:
-            raw_activities = client.get_activities_by_date(
-                start_date.isoformat(), end_date.isoformat()
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise GarminUnavailableError(f"Garmin fetch failed: {exc}") from exc
+        last_exc: Exception | None = None
+        attempt = 0
+        max_attempts = max(len(RATE_LIMIT_BACKOFF_S), len(TRANSIENT_BACKOFF_S)) + 1
+        while attempt < max_attempts:
+            try:
+                return client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                schedule = RATE_LIMIT_BACKOFF_S if _is_rate_limited(exc) else TRANSIENT_BACKOFF_S
+                if attempt >= len(schedule):
+                    break
+                wait = schedule[attempt]
+                logger.warning(
+                    "Garmin fetch failed (%s), attempt %d — backing off %.0fs: %s",
+                    "rate-limited" if _is_rate_limited(exc) else "transient", attempt + 1, wait, exc,
+                )
+                self._sleep(wait)
+                attempt += 1
+        raise GarminUnavailableError(f"Garmin fetch failed after retries: {last_exc}") from last_exc
+
+    def fetch_activities(self, start_date: date, end_date: date) -> list[Activity]:
+        raw_activities = self._fetch_with_retries(start_date, end_date)
 
         activities = []
         for raw in raw_activities:
+            type_key = ((raw.get("activityType") or {}).get("typeKey") or "").lower()
+            if type_key not in INCLUDED_TYPE_KEYS:
+                continue
             try:
                 activities.append(_normalize(raw))
             except Exception:  # noqa: BLE001

@@ -13,7 +13,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from ..models import Activity, ConversationEntry, HealthFlag, PlanVersion, ReferenceChunk, ReferenceDoc
+from ..models import (
+    Activity,
+    ConversationEntry,
+    HealthFlag,
+    PlanVersion,
+    ReferenceChunk,
+    ReferenceDoc,
+    RunFeedback,
+)
 from .base import StorageBackend
 
 
@@ -23,11 +31,27 @@ class GCPBackend(StorageBackend):
         self.bq_dataset = bq_dataset
         self.gcs_bucket = gcs_bucket
 
-    def save_activities(self, activities: list[Activity]) -> int:
+    def save_activities(self, activities: list[Activity]) -> tuple[int, int]:
         """Intended: MERGE into BigQuery table `{dataset}.activities`, keyed on activity_id."""
         raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
 
     def get_activities(self, since: Optional[datetime] = None) -> list[Activity]:
+        raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
+
+
+    def delete_activities(self, activity_ids: list[str]) -> int:
+        raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
+
+    def get_preference(self, key: str) -> Optional[str]:
+        raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
+
+    def set_preference(self, key: str, value: str) -> None:
+        raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
+
+    def save_run_feedback(self, feedback: RunFeedback) -> None:
+        raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
+
+    def get_recent_run_feedback(self, days: int = 14, limit: int = 20) -> list[RunFeedback]:
         raise NotImplementedError("GCPBackend is a stub — see storage/gcp.py docstring.")
 
     def get_last_sync_time(self) -> Optional[datetime]:

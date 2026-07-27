@@ -34,6 +34,7 @@ from ..models import (
     PlanWeek,
     ReferenceChunk,
     ReferenceDoc,
+    RunFeedback,
 )
 from .base import StorageBackend
 
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS activities (
     max_hr INTEGER,
     elevation_gain_ft REAL,
     name TEXT,
+    start_time TEXT,
     raw_json TEXT NOT NULL,
     synced_at TEXT NOT NULL
 );
@@ -97,6 +99,19 @@ CREATE TABLE IF NOT EXISTS health_flags (
     flag TEXT NOT NULL,
     note TEXT
 );
+
+CREATE TABLE IF NOT EXISTS preferences (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    comment TEXT,
+    activity_date TEXT
+);
 """
 
 _CHUNK_WORD_TARGET = 180
@@ -133,7 +148,17 @@ class LocalBackend(StorageBackend):
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate()
         self._fts_available = self._try_enable_fts()
+
+    def _migrate(self) -> None:
+        """Additive, idempotent migrations for databases created by earlier
+        versions of the schema (CREATE IF NOT EXISTS handles new tables;
+        this handles new columns on existing tables)."""
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(activities)")}
+        if "start_time" not in columns:
+            self._conn.execute("ALTER TABLE activities ADD COLUMN start_time TEXT")
+            self._conn.commit()
 
     def _try_enable_fts(self) -> bool:
         try:
@@ -152,26 +177,62 @@ class LocalBackend(StorageBackend):
 
     # --- activities -----------------------------------------------------------
 
-    def save_activities(self, activities: list[Activity]) -> int:
+    @staticmethod
+    def _materially_different(row: sqlite3.Row, a: Activity) -> bool:
+        """True when an incoming activity differs from the stored row in a
+        way that indicates the athlete edited it on Garmin (distance/time
+        corrections, renames, HR fixes)."""
+        stored_start = row["start_time"]
+        incoming_start = a.start_time.isoformat() if a.start_time else None
+        return (
+            abs((row["distance_mi"] or 0.0) - a.distance_mi) > 0.005
+            or row["duration_s"] != a.duration_s
+            or (row["name"] or None) != (a.name or None)
+            or (row["avg_hr"] or None) != (a.avg_hr or None)
+            or (stored_start or None) != incoming_start
+            or row["date"] != a.date.isoformat()
+        )
+
+    def save_activities(self, activities: list[Activity]) -> tuple[int, int]:
         now = datetime.utcnow().isoformat()
         new_count = 0
+        updated_count = 0
         with self._lock:
             for a in activities:
-                cur = self._conn.execute(
-                    """INSERT OR IGNORE INTO activities
-                       (activity_id, date, activity_type, distance_mi, duration_s,
-                        avg_pace_min_per_mi, avg_hr, max_hr, elevation_gain_ft, name,
-                        raw_json, synced_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        a.activity_id, a.date.isoformat(), a.activity_type.value, a.distance_mi,
-                        a.duration_s, a.avg_pace_min_per_mi, a.avg_hr, a.max_hr,
-                        a.elevation_gain_ft, a.name, json.dumps(a.raw), now,
-                    ),
-                )
-                new_count += cur.rowcount
+                existing = self._conn.execute(
+                    "SELECT * FROM activities WHERE activity_id = ?", (a.activity_id,)
+                ).fetchone()
+                if existing is None:
+                    self._conn.execute(
+                        """INSERT INTO activities
+                           (activity_id, date, activity_type, distance_mi, duration_s,
+                            avg_pace_min_per_mi, avg_hr, max_hr, elevation_gain_ft, name,
+                            start_time, raw_json, synced_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            a.activity_id, a.date.isoformat(), a.activity_type.value, a.distance_mi,
+                            a.duration_s, a.avg_pace_min_per_mi, a.avg_hr, a.max_hr,
+                            a.elevation_gain_ft, a.name,
+                            a.start_time.isoformat() if a.start_time else None,
+                            json.dumps(a.raw), now,
+                        ),
+                    )
+                    new_count += 1
+                elif self._materially_different(existing, a):
+                    self._conn.execute(
+                        """UPDATE activities SET date=?, activity_type=?, distance_mi=?, duration_s=?,
+                           avg_pace_min_per_mi=?, avg_hr=?, max_hr=?, elevation_gain_ft=?, name=?,
+                           start_time=?, raw_json=?, synced_at=? WHERE activity_id=?""",
+                        (
+                            a.date.isoformat(), a.activity_type.value, a.distance_mi, a.duration_s,
+                            a.avg_pace_min_per_mi, a.avg_hr, a.max_hr, a.elevation_gain_ft, a.name,
+                            a.start_time.isoformat() if a.start_time else None,
+                            json.dumps(a.raw), now, a.activity_id,
+                        ),
+                    )
+                    updated_count += 1
             self._conn.commit()
-        return new_count
+        return new_count, updated_count
 
     def get_activities(self, since: Optional[datetime] = None) -> list[Activity]:
         with self._lock:
@@ -182,6 +243,17 @@ class LocalBackend(StorageBackend):
             else:
                 rows = self._conn.execute("SELECT * FROM activities ORDER BY date").fetchall()
         return [self._row_to_activity(r) for r in rows]
+
+    def delete_activities(self, activity_ids: list[str]) -> int:
+        if not activity_ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in activity_ids)
+            cur = self._conn.execute(
+                f"DELETE FROM activities WHERE activity_id IN ({placeholders})", activity_ids
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     @staticmethod
     def _row_to_activity(row: sqlite3.Row) -> Activity:
@@ -196,6 +268,7 @@ class LocalBackend(StorageBackend):
             max_hr=row["max_hr"],
             elevation_gain_ft=row["elevation_gain_ft"],
             name=row["name"],
+            start_time=datetime.fromisoformat(row["start_time"]) if row["start_time"] else None,
             raw=json.loads(row["raw_json"]),
         )
 
@@ -395,3 +468,48 @@ class LocalBackend(StorageBackend):
             if ts.timestamp() >= cutoff:
                 flags.append(HealthFlag(timestamp=ts, flag=r["flag"], note=r["note"]))
         return flags
+
+    # --- preferences ---------------------------------------------------------
+
+    def get_preference(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM preferences WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_preference(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO preferences (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    # --- run feedback --------------------------------------------------------
+
+    def save_run_feedback(self, feedback: RunFeedback) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run_feedback (timestamp, score, comment, activity_date) VALUES (?, ?, ?, ?)",
+                (
+                    feedback.timestamp.isoformat(), feedback.score, feedback.comment,
+                    feedback.activity_date.isoformat() if feedback.activity_date else None,
+                ),
+            )
+            self._conn.commit()
+
+    def get_recent_run_feedback(self, days: int = 14, limit: int = 20) -> list[RunFeedback]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM run_feedback ORDER BY timestamp DESC LIMIT ?", (limit,)
+            ).fetchall()
+        cutoff = datetime.utcnow().timestamp() - days * 86400
+        out = []
+        for r in rows:
+            ts = datetime.fromisoformat(r["timestamp"])
+            if ts.timestamp() >= cutoff:
+                out.append(RunFeedback(
+                    timestamp=ts, score=r["score"], comment=r["comment"],
+                    activity_date=date.fromisoformat(r["activity_date"]) if r["activity_date"] else None,
+                ))
+        return out

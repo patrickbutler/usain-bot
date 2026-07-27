@@ -84,8 +84,12 @@ def tool_shift_marathon_date(service: CoachService, input: dict) -> dict:
     if plan is None:
         return {"error": "No plan exists yet."}
     weeks = int(input["weeks"])
-    today = service.get_today()
-    result = planner.shift_marathon(plan, service.config, today.anchors, date.today(), weeks, "requested via chat")
+    # Read-only anchors, not get_today(): get_today() can persist a new
+    # plan version as a side effect if its cache is stale, which would
+    # race with the version number this function is about to compute
+    # from `plan` above.
+    anchors = service.get_current_anchors()
+    result = planner.shift_marathon(plan, service.config, anchors, date.today(), weeks, "requested via chat")
     return _apply_override_result(service, result)
 
 
@@ -121,7 +125,54 @@ def tool_search_coaching_references(service: CoachService, input: dict) -> dict:
 
 def tool_trigger_garmin_sync(service: CoachService, input: dict) -> dict:
     sync_result = service.sync()
-    return {"new_activities": sync_result.activities_count, "live": sync_result.live, "message": sync_result.message}
+    return {
+        "new_activities": sync_result.activities_count,
+        "updated_activities": sync_result.updated_count,
+        "rejected_count": sync_result.rejected_count,
+        "repaired_count": sync_result.repaired_count,
+        "deduped_count": sync_result.deduped_count,
+        "live": sync_result.live,
+        "message": sync_result.message,
+    }
+
+
+def tool_record_run_feeling(service: CoachService, input: dict) -> dict:
+    score = int(input["score"])
+    comment = input.get("comment")
+    raw_date = input.get("activity_date")
+    activity_date = date.fromisoformat(raw_date) if raw_date else None
+    fb = service.record_run_feeling(score, comment, activity_date)
+    return {
+        "recorded": True, "score": fb.score, "comment": fb.comment,
+        "activity_date": fb.activity_date.isoformat() if fb.activity_date else None,
+        "message": "Logged. This feeds the distance recommendation directly — a rough stretch caps today's ceiling.",
+    }
+
+
+def tool_get_recent_feelings(service: CoachService, input: dict) -> dict:
+    return service.get_recent_feelings_payload(days=int(input.get("days", 14)))
+
+
+def tool_get_unrated_recent_runs(service: CoachService, input: dict) -> dict:
+    runs = service.get_unrated_recent_runs(days=int(input.get("days", 10)))
+    return {"unrated_runs": runs, "count": len(runs)}
+
+
+def tool_push_milestone(service: CoachService, input: dict) -> dict:
+    return service.push_milestone(str(input["milestone"]), int(input["weeks"]))
+
+
+def tool_validate_plan(service: CoachService, input: dict) -> dict:
+    return service.get_plan_validation()
+
+
+def tool_clear_health_flag(service: CoachService, input: dict) -> dict:
+    result = service.clear_health_flag()
+    return {
+        "cleared": True,
+        "today_recommendation": result.recommendation.to_dict(),
+        "message": "Health flag cleared — today's recommendation recomputed without the conservative cap.",
+    }
 
 
 def _apply_override_result(service: CoachService, result: planner.OverrideResult) -> dict:
@@ -237,6 +288,68 @@ TOOL_SPECS: list[ToolSpec] = [
         description="Manually pull the latest Garmin activities before answering, if the athlete wants to make sure the data is fresh (e.g. just finished a run).",
         input_schema={"type": "object", "properties": {}},
     ),
+    ToolSpec(
+        name="record_run_feeling",
+        description=(
+            "Log how a run felt on a 1-5 scale (1=awful/pain, 3=okay, 5=great). Call this WHENEVER the "
+            "athlete describes how a run or their body felt — 'legs were dead', 'felt smooth', 'rough one "
+            "today' — don't wait to be asked to record it. This directly lowers the distance ceiling when "
+            "the recent average is poor, so it materially changes recommendations."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer", "description": "1-5, where 1=awful/pain and 5=great"},
+                "comment": {"type": "string", "description": "The athlete's own words about how it felt"},
+                "activity_date": {"type": "string", "description": "ISO date of the run being rated, if known"},
+            },
+            "required": ["score"],
+        },
+    ),
+    ToolSpec(
+        name="get_recent_feelings",
+        description="Read back the athlete's recent run-feeling history (scores + comments + mean). Use it to spot patterns and to avoid re-asking about runs already rated.",
+        input_schema={"type": "object", "properties": {"days": {"type": "integer", "description": "default 14"}}},
+    ),
+    ToolSpec(
+        name="get_unrated_recent_runs",
+        description=(
+            "List recent completed runs the athlete hasn't told you how they felt about yet. Call this at "
+            "the start of a conversation so you can ask about them — asking how recent runs felt is part of "
+            "the job, not an optional extra."
+        ),
+        input_schema={"type": "object", "properties": {"days": {"type": "integer", "description": "default 10"}}},
+    ),
+    ToolSpec(
+        name="push_milestone",
+        description=(
+            "Delay a FLEXIBLE-date milestone by N weeks: 'half_marathon' or 'ultra_50k'. The marathon date "
+            "is fixed and cannot be pushed this way (use shift_marathon_date for that, and warn about the "
+            "consequences). The plan fills the extra weeks with normal build/back-off weeks to hold the base."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "milestone": {"type": "string", "enum": ["half_marathon", "ultra_50k"]},
+                "weeks": {"type": "integer", "description": "Weeks to push later (positive)"},
+            },
+            "required": ["milestone", "weeks"],
+        },
+    ),
+    ToolSpec(
+        name="validate_plan",
+        description=(
+            "Run the deterministic plan validator: checks the 12 mi-before-half, 20 mi-before-marathon, "
+            "3x30mi-weeks-before-50K prerequisites, taper lengths, the fixed marathon date, and gradual "
+            "build limits. Use it when the athlete asks whether the plan actually gets them ready."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="clear_health_flag",
+        description="Remove an active hip/back/fatigue flag (e.g. the athlete set one by mistake, or the symptom has resolved) and recompute today without the conservative cap.",
+        input_schema={"type": "object", "properties": {}},
+    ),
 ]
 
 _DISPATCH: dict[str, Callable[[CoachService, dict], dict]] = {
@@ -250,6 +363,12 @@ _DISPATCH: dict[str, Callable[[CoachService, dict], dict]] = {
     "set_health_flag": tool_set_health_flag,
     "search_coaching_references": tool_search_coaching_references,
     "trigger_garmin_sync": tool_trigger_garmin_sync,
+    "record_run_feeling": tool_record_run_feeling,
+    "get_recent_feelings": tool_get_recent_feelings,
+    "get_unrated_recent_runs": tool_get_unrated_recent_runs,
+    "push_milestone": tool_push_milestone,
+    "validate_plan": tool_validate_plan,
+    "clear_health_flag": tool_clear_health_flag,
 }
 
 

@@ -48,9 +48,9 @@
         <div class="card-header">
           <h2>Today's recommendation</h2>
           <div class="header-actions">
-            <button id="flag-hip" class="flag-btn" title="Hip flag">Hip</button>
-            <button id="flag-back" class="flag-btn" title="Back flag">Back</button>
-            <button id="flag-fatigue" class="flag-btn" title="Fatigue flag">Fatigue</button>
+            <button id="flag-hip" class="flag-btn" title="Toggle hip flag">Hip</button>
+            <button id="flag-back" class="flag-btn" title="Toggle back flag">Back</button>
+            <button id="flag-fatigue" class="flag-btn" title="Toggle fatigue flag">Fatigue</button>
             <button id="refresh-today" class="ghost-btn">Refresh</button>
           </div>
         </div>
@@ -60,6 +60,22 @@
       <div class="card">
         <h2>Next 7 days</h2>
         <div id="next7-body" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <div class="card-header">
+          <h2>How are the runs feeling?</h2>
+          <span class="hint-text">Feeds the distance ceiling directly — a rough stretch caps today's mileage</span>
+        </div>
+        <div id="feelings-body" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <div class="card-header">
+          <h2>Plan validation</h2>
+          <span class="hint-text">Deterministic checks against your milestone rules</span>
+        </div>
+        <div id="validation-body" class="loading">Loading…</div>
       </div>
 
       <div class="card wide">

@@ -49,6 +49,13 @@ storage:
     references_dir: references
 
 chat:
-  provider: anthropic              # only provider implemented today — see chat/providers/
-  model: claude-sonnet-5
+  provider: openai                 # "openai" (default) | "gemini" | "anthropic" — see chat/providers/
+  model: gpt-4o
   max_tokens: 1536
+
+sync:
+  overlap_days: 30                 # re-pull this trailing window every sync to catch edited activities
+  backfill_chunk_days: 90
+  backfill_pause_s: 2.0            # pause between backfill chunks (Garmin rate-limits)
+  backfill_max_empty_chunks: 4
+  merge_gap_hours: 3.0             # runs closer together than this count as one split session
