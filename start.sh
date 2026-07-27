@@ -7,6 +7,13 @@
 #
 # Handles: venv creation/activation, dependency install, first-run plan
 # generation, and launching the UI in your browser. Safe to re-run.
+#
+# Compatibility note: macOS still ships bash 3.2, where `set -u` treats an
+# EMPTY array expansion (`"${arr[@]}"`) as an unbound variable and aborts —
+# bash 4.4+ does not. Rather than rely on the `${arr[@]+...}` idiom being
+# interpreted identically across versions, this script branches explicitly
+# on the array's length (`${#arr[@]}` is always defined), which behaves the
+# same on every bash.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,12 +22,14 @@ VENV_DIR=".venv"
 DEMO=0
 SERVE_ARGS=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --demo) DEMO=1 ;;
-    *) SERVE_ARGS+=("$arg") ;;
-  esac
-done
+if [ "$#" -gt 0 ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --demo) DEMO=1 ;;
+      *) SERVE_ARGS+=("$arg") ;;
+    esac
+  done
+fi
 
 if [ "$DEMO" -eq 1 ]; then
   SERVE_ARGS+=(--mock-fixture tests/fixtures/mock_activities.json)
@@ -65,4 +74,8 @@ fi
 
 # --- launch -------------------------------------------------------------
 echo "==> Starting usain-bot. Press Ctrl+C to stop."
-exec usain-bot serve --open "${SERVE_ARGS[@]}"
+if [ "${#SERVE_ARGS[@]}" -eq 0 ]; then
+  exec usain-bot serve --open
+else
+  exec usain-bot serve --open "${SERVE_ARGS[@]}"
+fi
