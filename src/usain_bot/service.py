@@ -19,12 +19,13 @@ from typing import Optional
 
 from . import agent
 from . import planner
-from .classification import classify_activities
+from .classification import compute_anchors, prepare_classified
 from .config import Config
 from .garmin_adapter.base import GarminAdapter
-from .models import ClassifiedActivity, HealthFlag, PlanVersion
+from .models import Anchors, ClassifiedActivity, HealthFlag, PlanVersion, RunFeedback
 from .projection import project_next_7_days
 from .storage.base import StorageBackend
+from .validation import validate_plan
 
 
 class CoachService:
@@ -85,9 +86,110 @@ class CoachService:
         self.storage.save_health_flag(HealthFlag(timestamp=datetime.utcnow(), flag=flag, note=note))
         return self.refresh_today(health_flag=flag)
 
-    def clear_health_flag(self) -> None:
+    def clear_health_flag(self) -> agent.InvocationResult:
+        """Undo an active health flag (mis-tap, or the symptom resolved)
+        and recompute today without the conservative branch. The original
+        flag stays in history — it happened — but it stops constraining
+        today's recommendation."""
         with self._lock:
             self._cached_flag = None
+            self._cached = None
+        return self.refresh_today()
+
+    @property
+    def active_health_flag(self) -> Optional[str]:
+        with self._lock:
+            return self._cached_flag
+
+    # --- run feelings (subjective-state memory) ------------------------------
+
+    def record_run_feeling(self, score: int, comment: Optional[str] = None,
+                            activity_date: Optional[date] = None) -> RunFeedback:
+        score = max(1, min(5, int(score)))
+        fb = RunFeedback(timestamp=datetime.utcnow(), score=score, comment=comment, activity_date=activity_date)
+        self.storage.save_run_feedback(fb)
+        with self._lock:
+            self._cached = None  # today's ceiling may now be lower
+        return fb
+
+    def get_recent_feelings_payload(self, days: int = 14) -> dict:
+        feedback = self.storage.get_recent_run_feedback(days=days)
+        mean = round(sum(f.score for f in feedback) / len(feedback), 2) if feedback else None
+        return {
+            "window_days": days,
+            "count": len(feedback),
+            "mean_score": mean,
+            "entries": [
+                {
+                    "timestamp": f.timestamp.isoformat(), "score": f.score, "comment": f.comment,
+                    "activity_date": f.activity_date.isoformat() if f.activity_date else None,
+                }
+                for f in feedback
+            ],
+        }
+
+    def get_unrated_recent_runs(self, days: int = 10) -> list[dict]:
+        """Recent runs with no feeling logged — what the coach should ask
+        about. Matched by date; a run is 'rated' if any feedback entry
+        names that date, or was recorded after the run happened on a day
+        with no explicit activity_date."""
+        classified = self.get_history(days=days)
+        runs = [c for c in classified if c.run_class.value != "cross_training"]
+        feedback = self.storage.get_recent_run_feedback(days=days + 7, limit=100)
+        rated_dates = {f.activity_date for f in feedback if f.activity_date}
+        out = []
+        for c in sorted(runs, key=lambda c: c.activity.date, reverse=True):
+            if c.activity.date in rated_dates:
+                continue
+            out.append({
+                "date": c.activity.date.isoformat(),
+                "run_class": c.run_class.value,
+                "distance_mi": round(c.activity.distance_mi, 2),
+                "name": c.activity.name,
+            })
+        return out
+
+    # --- milestone scheduling preferences ------------------------------------
+
+    def push_milestone(self, milestone: str, weeks: int) -> dict:
+        """Delay a flexible-date milestone (half marathon or 50K) by N
+        weeks. Persisted as a preference so it survives the plan being
+        regenerated from anchors on every invocation; the planner fills
+        the extra time with normal build/back-off weeks to hold the base
+        rather than going flat."""
+        key = {"half_marathon": agent.PREF_HM_DELAY_WEEKS, "ultra_50k": agent.PREF_ULTRA_DELAY_WEEKS}.get(milestone)
+        if key is None:
+            return {"error": "milestone must be 'half_marathon' or 'ultra_50k' (the marathon date is fixed)."}
+        current = int(self.storage.get_preference(key) or 0)
+        new_value = max(0, current + int(weeks))
+        self.storage.set_preference(key, str(new_value))
+        result = self.refresh_today()
+        return {
+            "milestone": milestone,
+            "delay_weeks_total": new_value,
+            "message": (
+                f"{milestone.replace('_', ' ').title()} pushed by {weeks} week(s) "
+                f"(total delay now {new_value}). Plan regenerated — the extra weeks are filled with "
+                "normal build/back-off weeks so the base is maintained."
+            ),
+            "plan_version": result.plan.version,
+        }
+
+    def get_plan_validation(self) -> dict:
+        plan = self.get_plan()
+        if plan is None:
+            return {"error": "No plan exists yet."}
+        marathon_goal = self.config.goal("marathon")
+        if not marathon_goal or not marathon_goal.date:
+            return {"error": "No marathon date configured to validate against."}
+        issues = validate_plan(plan.weeks, date.fromisoformat(marathon_goal.date))
+        return {
+            "plan_version": plan.version,
+            "valid": not any(i.severity == "error" for i in issues),
+            "error_count": sum(1 for i in issues if i.severity == "error"),
+            "warning_count": sum(1 for i in issues if i.severity == "warning"),
+            "issues": [i.to_dict() for i in issues],
+        }
 
     def get_today_payload(self, as_of: Optional[date] = None) -> dict:
         """Single source of truth for "today" as JSON — used by both the
@@ -113,6 +215,9 @@ class CoachService:
             },
             "sync": {"live": result.sync.live, "message": result.sync.message},
             "plan_version": plan.version,
+            "active_health_flag": self.active_health_flag,
+            "runs_per_week_actual": result.anchors.runs_per_week,
+            "unrated_recent_runs": self.get_unrated_recent_runs(),
         }
 
     def get_plan(self) -> Optional[PlanVersion]:
@@ -132,6 +237,7 @@ class CoachService:
             "rationale": plan.rationale,
             "weeks": [w.to_dict() for w in plan.weeks],
             "half_marathon_capability_week": capable_week,
+            "validation": self.get_plan_validation(),
         }
 
     def get_plan_history(self) -> list[PlanVersion]:
@@ -161,11 +267,27 @@ class CoachService:
         entries.reverse()  # newest first
         return {"versions": entries}
 
+    def get_current_anchors(self, as_of: Optional[date] = None) -> Anchors:
+        """Read-only anchors (classify stored activities, compute load) —
+        no plan regeneration, no persistence. Use this instead of
+        get_today()/refresh_today() whenever a caller just needs anchors
+        (e.g. to feed a plan mutation like shift_marathon) rather than a
+        full "today" recommendation; get_today() runs the whole decision
+        procedure and can persist a new plan version as a side effect,
+        which would race with a caller that already fetched a plan
+        version and is about to save its own edit to it."""
+        as_of = as_of or date.today()
+        activities = self.storage.get_activities()
+        classified = prepare_classified(activities, self.config.sync.merge_gap_hours)
+        planned_runs_14d = self.config.athlete.available_run_days_per_week * 2
+        return compute_anchors(classified, as_of, planned_runs_trailing_14d=planned_runs_14d)
+
     def get_history(self, days: int = 90) -> list[ClassifiedActivity]:
         activities = self.storage.get_activities()
-        classified = classify_activities(activities)
+        classified = prepare_classified(activities, self.config.sync.merge_gap_hours)
         cutoff = date.today() - timedelta(days=days)
         return [c for c in classified if c.activity.date >= cutoff]
 
     def sync(self, as_of: Optional[date] = None) -> agent.SyncResult:
-        return agent.sync_activities(self.storage, self.adapter, as_of or date.today())
+        return agent.sync_activities(self.storage, self.adapter, as_of or date.today(),
+                                      overlap_days=self.config.sync.overlap_days)

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import agent
+from .chat.providers import get_required_env_var
 from .config import Config, GarminCredentials, load_config
 from .garmin_adapter.base import GarminAdapter
 from .garmin_adapter.live import GarminConnectAdapter
@@ -174,7 +175,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     print("\n" + "-" * 70)
     print("PROPOSED MACRO PLAN (v1) — base -> 13.1 capability -> marathon block -> "
-          "taper -> marathon -> recovery -> 50K block (TBD) -> 50K (TBD)")
+          "taper -> marathon (fixed date) -> recovery -> 50K build -> 50K")
     print("-" * 70)
     for w in report.proposed_plan.weeks:
         flag = " [back-off]" if w.is_backoff else ""
@@ -249,6 +250,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    import threading
     import uvicorn
 
     from .web.app import create_app
@@ -258,10 +260,35 @@ def cmd_serve(args: argparse.Namespace) -> int:
     adapter_ = _build_adapter(args.mock_fixture)
     app = create_app(config, storage, adapter_)
 
-    print(f"usain-bot web UI at http://{args.host}:{args.port}")
-    if config.chat.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[!] ANTHROPIC_API_KEY not set — every tab except Chat will still work.")
+    url = f"http://{args.host}:{args.port}"
+    print(f"usain-bot web UI at {url}")
+    required_var = get_required_env_var(config.chat.provider)
+    if required_var and not os.environ.get(required_var):
+        print(f"[!] {required_var} not set for chat provider '{config.chat.provider}' — every tab except Chat will still work.")
+
+    if getattr(args, "open", False):
+        # Give uvicorn a moment to bind before the browser requests the page.
+        threading.Timer(1.5, lambda: __import__("webbrowser").open(url)).start()
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="info" if args.verbose else "warning")
+    return 0
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    storage = get_storage_backend(config)
+    adapter_ = _build_adapter(args.mock_fixture)
+
+    print("Starting full-history Garmin backfill (chunked + rate-limit aware; this can take a while)...")
+    result = agent.backfill_history(
+        config, storage, adapter_,
+        as_of=date.fromisoformat(args.date) if args.date else None,
+        max_years=args.max_years,
+    )
+    print(result.message)
+    if not result.complete:
+        print("[!] Backfill did not finish — re-run `usain-bot backfill` to resume where it left off.")
+        return 1
     return 0
 
 
@@ -362,8 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="Run the local web UI (chat + upcoming + history)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8420)
+    p_serve.add_argument("--open", action="store_true", help="Open the UI in your browser once the server is up")
     p_serve.add_argument("--mock-fixture", help="Path to a mock Garmin activities JSON fixture (for local testing)")
     p_serve.set_defaults(func=cmd_serve)
+
+    p_backfill = sub.add_parser("backfill", help="One-time full-history Garmin import (chunked, rate-limit aware)")
+    p_backfill.add_argument("--date", help="Override 'today' (ISO date)")
+    p_backfill.add_argument("--max-years", type=int, default=15, help="How far back to walk (default 15)")
+    p_backfill.add_argument("--mock-fixture", help="Path to a mock Garmin activities JSON fixture")
+    p_backfill.set_defaults(func=cmd_backfill)
+
+
 
     return parser
 

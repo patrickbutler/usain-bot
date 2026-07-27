@@ -125,6 +125,16 @@ def classify_activities(activities: list[Activity]) -> list[ClassifiedActivity]:
     return classified
 
 
+def prepare_classified(activities: list[Activity], merge_gap_hours: float = 3.0) -> list[ClassifiedActivity]:
+    """The standard pipeline every reader should use: merge split-run
+    recordings into sessions first (sessions.py), then classify. Anchors
+    computed from unmerged activities would misread one split long run
+    as several short runs."""
+    from .sessions import merge_split_runs
+
+    return classify_activities(merge_split_runs(activities, gap_hours=merge_gap_hours))
+
+
 def _in_trailing_window(d: date, as_of: date, days: int) -> bool:
     return as_of - timedelta(days=days - 1) <= d <= as_of
 
@@ -151,6 +161,21 @@ def detect_gap(classified: list[ClassifiedActivity], as_of: date) -> GapInfo:
         severity = GapSeverity.SHORT
 
     return GapInfo(gap_days=gap_days, severity=severity, last_run_date=last_run)
+
+
+def derive_run_days_per_week(classified: list[ClassifiedActivity], as_of: date) -> Optional[int]:
+    """Actual running frequency: distinct days with at least one run in
+    the trailing 28 days, divided by 4 and rounded. None when there's no
+    recent running to derive from (cold start / long gap) — callers fall
+    back to the configured value then. This is what makes the plan adapt
+    when the athlete runs more or fewer days than config says."""
+    run_days = {
+        c.activity.date for c in classified
+        if c.run_class in RUNNING_CLASSES and _in_trailing_window(c.activity.date, as_of, 28)
+    }
+    if not run_days:
+        return None
+    return max(1, min(7, round(len(run_days) / 4)))
 
 
 def compute_anchors(
@@ -195,4 +220,5 @@ def compute_anchors(
         adherence_rate=adherence_rate,
         acwr=acwr,
         gap=gap,
+        runs_per_week=derive_run_days_per_week(classified, as_of),
     )
