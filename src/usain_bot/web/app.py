@@ -49,6 +49,24 @@ class PushMilestoneRequest(BaseModel):
     weeks: int
 
 
+class PlanRevisionRequest(BaseModel):
+    rationale: str = "Athlete-requested plan revision"
+    pacing_mode: Optional[str] = None
+    max_weeks_at_peak: Optional[int] = None
+    peak_long_run_cap: Optional[float] = None
+    hm_delay_weeks: Optional[int] = None
+    ultra_delay_weeks: Optional[int] = None
+    run_days_per_week: Optional[int] = None
+
+
+class PublishDraftRequest(BaseModel):
+    approval_note: str = ""
+
+
+class SettingsRequest(BaseModel):
+    jamaican_mode: Optional[bool] = None
+
+
 def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) -> FastAPI:
     app = FastAPI(title="usain-bot")
     service = CoachService(config, storage, adapter)
@@ -140,9 +158,43 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
     def plan_validation():
         return service.get_plan_validation()
 
+    @app.post("/api/plan/revision/propose")
+    def propose_plan_revision(req: PlanRevisionRequest):
+        """Recompute the plan under new constraints as an unsaved DRAFT."""
+        from ..planner import PacingMode, PlanConstraints
+
+        mode = None
+        if req.pacing_mode:
+            try:
+                mode = PacingMode(req.pacing_mode)
+            except ValueError:
+                raise HTTPException(400, f"pacing_mode must be one of {[m.value for m in PacingMode]}")
+        constraints = PlanConstraints(
+            pacing_mode=mode, max_weeks_at_peak=req.max_weeks_at_peak,
+            peak_long_run_cap=req.peak_long_run_cap, hm_delay_weeks=req.hm_delay_weeks,
+            ultra_delay_weeks=req.ultra_delay_weeks, run_days_per_week=req.run_days_per_week,
+        )
+        return service.propose_plan_revision(constraints, req.rationale)
+
+    @app.post("/api/plan/revision/publish")
+    def publish_plan_revision(req: PublishDraftRequest):
+        result = service.publish_draft_plan(req.approval_note)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return result
+
+    @app.delete("/api/plan/revision")
+    def discard_plan_revision():
+        return service.discard_draft_plan()
+
     @app.get("/api/feelings")
     def get_feelings(days: int = 14):
         return service.get_recent_feelings_payload(days=max(1, min(days, 365)))
+
+    @app.get("/api/runs/feelings")
+    def get_run_feelings(days: int = 90):
+        """History-tab view: runs joined with the score logged for them."""
+        return service.get_run_feelings_payload(days=max(7, min(days, 365)))
 
     @app.post("/api/feelings")
     def record_feeling(req: RunFeelingRequest):
@@ -185,11 +237,44 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
         result = run_chat_turn(provider, service, req.message)
         return {"reply": result.reply, "tool_calls": result.tool_calls}
 
+    @app.get("/api/settings")
+    def get_settings():
+        from ..chat.session import PREF_JAMAICAN_MODE
+
+        return {
+            "jamaican_mode": (storage.get_preference(PREF_JAMAICAN_MODE) or "on") != "off",
+            "chat_provider": config.chat.provider,
+            "chat_model": config.chat.model,
+        }
+
+    @app.post("/api/settings")
+    def update_settings(req: SettingsRequest):
+        """Backs the hidden /settings page. Turning Jamaican mode off gives
+        the coach a neutral professional voice for demos — the guardrails,
+        tools and numbers are identical either way."""
+        from ..chat.session import PREF_JAMAICAN_MODE
+
+        if req.jamaican_mode is not None:
+            storage.set_preference(PREF_JAMAICAN_MODE, "on" if req.jamaican_mode else "off")
+        return get_settings()
+
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
         @app.get("/")
         def index():
             return FileResponse(str(STATIC_DIR / "index.html"))
+
+        @app.get("/settings")
+        def settings_page():
+            """Deliberately not linked from the main navigation — reachable
+            only by typing the URL."""
+            return FileResponse(str(STATIC_DIR / "settings.html"))
+
+        @app.get("/favicon.ico", include_in_schema=False)
+        def favicon():
+            """Browsers request this unprompted; serving the logo keeps a
+            404 out of the console."""
+            return FileResponse(str(STATIC_DIR / "logo.svg"), media_type="image/svg+xml")
 
     return app

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usain Bot · Settings</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="flag-stripe"></div>
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-logo" src="/static/logo.svg" alt="Usain Bot logo" />
+    <span class="brand-name"><b>Usain Bot</b><span>Settings</span></span>
+  </div>
+  <div class="status-pill">hidden page — not linked from the app</div>
+</header>
+
+<main>
+  <div class="grid">
+    <div class="card wide">
+      <div class="card-header">
+        <h2>Coach voice</h2>
+        <span class="hint-text">Turn the accent off for professional demos</span>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">Jamaican mode</div>
+          <div class="hint-text">
+            On: the coach speaks with a Jamaican accent and slang.
+            Off: clear, neutral, professional English.
+            <strong>Coaching is identical either way</strong> — same guardrails,
+            same tools, same numbers. Only the wording changes.
+          </div>
+        </div>
+        <button id="jamaican-toggle" class="toggle" role="switch" aria-checked="true">
+          <span class="toggle-knob"></span>
+        </button>
+      </div>
+
+      <p class="chat-note" id="settings-note"></p>
+    </div>
+
+    <div class="card wide">
+      <h2>Chat provider</h2>
+      <div id="provider-info" class="loading">Loading…</div>
+      <p class="hint-text" style="margin-top:10px">
+        Configured in <code>config.yaml</code> (<code>chat.provider</code> / <code>chat.model</code>)
+        or via <code>USAIN_BOT_CHAT_PROVIDER</code> / <code>USAIN_BOT_CHAT_MODEL</code>.
+      </p>
+    </div>
+
+    <div class="card wide">
+      <h2>Back to the app</h2>
+      <p class="hint-text"><a href="/">Return to Usain Bot</a></p>
+    </div>
+  </div>
+</main>
+
+<script src="/static/settings.js"></script>
+</body>
+</html>

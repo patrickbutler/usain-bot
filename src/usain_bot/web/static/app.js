@@ -58,14 +58,98 @@
     return `${Math.floor(secs / 86400)}d ago`;
   }
 
+  // ---------- markdown ----------
+  // Deliberately self-contained: no CDN, no bundler, no third-party parser.
+  // Everything is HTML-escaped up front, so the only tags that survive are
+  // the ones this function emits itself.
+  function renderInline(text) {
+    return text
+      .replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
+  }
+
+  function renderMarkdown(src) {
+    const lines = escapeHtml(String(src == null ? "" : src)).split("\n");
+    const out = [];
+    let list = null;      // "ul" | "ol" | null
+    let inCode = false;
+    let codeBuf = [];
+    let paraBuf = [];
+
+    const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+    const flushPara = () => {
+      if (paraBuf.length) { out.push(`<p>${renderInline(paraBuf.join(" "))}</p>`); paraBuf = []; }
+    };
+    const openList = (kind) => { if (list !== kind) { closeList(); out.push(`<${kind}>`); list = kind; } };
+
+    for (const raw of lines) {
+      const line = raw.replace(/\s+$/, "");
+
+      if (/^\s*```/.test(line)) {
+        if (inCode) { out.push(`<pre><code>${codeBuf.join("\n")}</code></pre>`); codeBuf = []; inCode = false; }
+        else { flushPara(); closeList(); inCode = true; }
+        continue;
+      }
+      if (inCode) { codeBuf.push(raw); continue; }
+
+      if (!line.trim()) { flushPara(); closeList(); continue; }
+
+      const heading = line.match(/^(#{1,4})\s+(.*)$/);
+      if (heading) {
+        flushPara(); closeList();
+        const level = Math.min(heading[1].length + 2, 6);   // # -> h3, keeps h1/h2 for the app chrome
+        out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+        continue;
+      }
+
+      if (/^(\*\*\*|---|___)\s*$/.test(line.trim())) { flushPara(); closeList(); out.push("<hr>"); continue; }
+
+      const quote = line.match(/^&gt;\s?(.*)$/);
+      if (quote) { flushPara(); closeList(); out.push(`<blockquote>${renderInline(quote[1])}</blockquote>`); continue; }
+
+      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      if (ul) { flushPara(); openList("ul"); out.push(`<li>${renderInline(ul[1])}</li>`); continue; }
+
+      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ol) { flushPara(); openList("ol"); out.push(`<li>${renderInline(ol[1])}</li>`); continue; }
+
+      // Pipe table: header row, separator, then body rows.
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        flushPara(); closeList();
+        const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+        const last = out[out.length - 1] || "";
+        if (/^[\s|:-]+$/.test(line) && last.startsWith("<table>")) continue;   // separator row
+        if (last.startsWith("<table>")) {
+          out[out.length - 1] = last.replace("</table>", `<tr>${cells(line).map((c) => `<td>${renderInline(c)}</td>`).join("")}</tr></table>`);
+        } else {
+          out.push(`<table><tr>${cells(line).map((c) => `<th>${renderInline(c)}</th>`).join("")}</tr></table>`);
+        }
+        continue;
+      }
+
+      paraBuf.push(line.trim());
+    }
+    if (inCode && codeBuf.length) out.push(`<pre><code>${codeBuf.join("\n")}</code></pre>`);
+    flushPara();
+    closeList();
+    return out.join("");
+  }
+
   // ---------- chat ----------
-  function appendMessage(role, text) {
+  function appendMessage(role, text, { markdown = false } = {}) {
     const log = $("#chat-log");
     const wrap = document.createElement("div");
     wrap.className = `msg ${role}`;
     const bubble = document.createElement("div");
-    bubble.className = "bubble";
-    bubble.textContent = text;
+    if (markdown) {
+      bubble.className = "bubble md";
+      bubble.innerHTML = renderMarkdown(text);
+    } else {
+      bubble.className = "bubble plain";
+      bubble.textContent = text;
+    }
     wrap.appendChild(bubble);
     log.appendChild(wrap);
     log.scrollTop = log.scrollHeight;
@@ -85,19 +169,41 @@
     log.scrollTop = log.scrollHeight;
   }
 
+  // Tools that can change what the other tabs show. When the coach runs one,
+  // the Upcoming tab is re-fetched immediately, so a plan change made in
+  // conversation is visible in the plan without a manual reload.
+  const MUTATING_TOOLS = new Set([
+    "publish_draft_plan", "ease_upcoming_week", "shift_marathon_date", "push_milestone",
+    "set_long_run_day_preference", "set_health_flag", "clear_health_flag",
+    "record_run_feeling", "trigger_garmin_sync",
+  ]);
+
+  async function refreshViewsAfterChat(toolCalls) {
+    if (!toolCalls || !toolCalls.some((t) => MUTATING_TOOLS.has(t))) return;
+    await loadUpcoming();
+    if ($("#panel-history").classList.contains("active")) loadHistory();
+  }
+
+  function autoGrow(el) {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+  }
+
   async function sendChat(message) {
     const input = $("#chat-input");
     const sendBtn = $("#chat-send");
     const note = $("#chat-note");
     appendMessage("user", message);
     input.value = "";
+    autoGrow(input);
     sendBtn.disabled = true;
     note.textContent = "thinking…";
     try {
       const result = await api("/api/chat", { method: "POST", body: JSON.stringify({ message }) });
-      appendMessage("agent", result.reply);
+      appendMessage("agent", result.reply, { markdown: true });
       appendToolNote(result.tool_calls);
       note.textContent = "";
+      await refreshViewsAfterChat(result.tool_calls);
     } catch (e) {
       note.textContent = String(e.message || e);
       appendMessage("agent", `Couldn't get a reply: ${e.message || e}`);
@@ -107,13 +213,31 @@
     }
   }
 
+  function submitChat() {
+    const input = $("#chat-input");
+    const text = input.value.trim();
+    if (text) sendChat(text);
+  }
+
   function initChat() {
+    const input = $("#chat-input");
+
     $("#chat-form").addEventListener("submit", (ev) => {
       ev.preventDefault();
-      const input = $("#chat-input");
-      const text = input.value.trim();
-      if (text) sendChat(text);
+      submitChat();
     });
+
+    // Enter inserts a newline (the textarea's own default); sending is
+    // deliberate — the Send button or Cmd/Ctrl+Enter.
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+        ev.preventDefault();
+        submitChat();
+      }
+    });
+    input.addEventListener("input", () => autoGrow(input));
+    autoGrow(input);
+
     $$("#quick-actions button").forEach((btn) => {
       btn.addEventListener("click", () => sendChat(btn.dataset.quick));
     });
@@ -412,10 +536,67 @@
     `;
   }
 
+  function renderRunFeelings(data) {
+    const el = $("#history-feelings");
+    const runs = data.runs || [];
+    if (!runs.length) {
+      el.innerHTML = `<p class="loading">No runs in this window yet.</p>`;
+      return;
+    }
+    const summary = data.mean_score !== null && data.mean_score !== undefined
+      ? `<p class="rec-line"><span class="label">Average feel:</span> ${data.mean_score}/5
+           across ${data.rated_count} rated run(s) · ${data.unrated_count} not scored yet</p>`
+      : `<p class="rec-line">None of these runs are scored yet — tap a number, or just tell the coach in chat.</p>`;
+
+    // A scored run shows its score and is never asked about again; only
+    // unscored runs get the 1-5 buttons.
+    const rows = runs.map((r) => `
+      <div class="feeling-row ${r.score ? "rated" : ""}">
+        <span class="day-date">${r.date.slice(5)}</span>
+        <span class="day-type"><span class="cap">${r.run_class}</span> · ${r.distance_mi.toFixed(1)} mi</span>
+        ${r.score
+          ? `<span class="day-dist">${escapeHtml(r.comment || "")}</span>
+             <span class="score-chip score-${r.score}">${r.score}/5 ${SCORE_LABELS[r.score] || ""}</span>`
+          : `<span class="score-buttons">${[1, 2, 3, 4, 5]
+              .map((s) => `<button class="score-btn" data-date="${r.date}" data-score="${s}" title="${SCORE_LABELS[s]}">${s}</button>`)
+              .join("")}</span>`}
+      </div>`).join("");
+
+    // Newest first in a bounded scroller — a 90-day window is 35+ runs and
+    // would otherwise push the rest of the tab off the screen.
+    el.innerHTML = summary + `<div class="feelings-scroll">${rows}</div>`;
+
+    $$(".score-btn", el).forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        $$(".score-btn", el).forEach((b) => { b.disabled = true; });
+        try {
+          await api("/api/feelings", {
+            method: "POST",
+            body: JSON.stringify({ score: Number(btn.dataset.score), activity_date: btn.dataset.date }),
+          });
+        } finally {
+          loadRunFeelings();
+        }
+      });
+    });
+  }
+
+  async function loadRunFeelings() {
+    const el = $("#history-feelings");
+    const days = $("#history-window").value;
+    try {
+      renderRunFeelings(await api(`/api/runs/feelings?days=${days}`));
+    } catch (e) {
+      el.innerHTML = `<p class="loading">Couldn't load: ${escapeHtml(e.message || String(e))}</p>`;
+    }
+  }
+
   async function loadHistory() {
     const days = $("#history-window").value;
     $("#history-chart").innerHTML = `<p class="loading">Loading…</p>`;
     $("#history-table").innerHTML = `<p class="loading">Loading…</p>`;
+    $("#history-feelings").innerHTML = `<p class="loading">Loading…</p>`;
+    loadRunFeelings();
     try {
       const data = await api(`/api/history?days=${days}`);
       renderHistoryChart(data.weekly_volume);

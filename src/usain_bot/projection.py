@@ -38,19 +38,30 @@ def run_days_for_week(run_days_per_week: int) -> list[int]:
 
 def project_next_7_days(
     as_of: date, run_days_per_week: int, quality_target: int, is_backoff: bool,
-    recommendation: Recommendation,
+    recommendation: Recommendation, long_run_was_yesterday: bool = False,
 ) -> list[DayProjection]:
     run_days = run_days_for_week(run_days_per_week)
     long_day = max(run_days)
     quality_day = min(run_days) if quality_target > 0 and not is_backoff else None
+    # Hard rule (guardrails.requires_rest_after_long_run): the day after a
+    # long run is always off, so the projection must never draw a run there
+    # even if it falls on a normal run day.
+    rest_weekday = (long_day + 1) % 7
 
     out = []
     for offset in range(7):
         d = as_of + timedelta(days=offset)
         weekday = d.weekday()
         if offset == 0:
-            out.append(DayProjection(d, d.strftime("%A"), recommendation.run_type,
-                                      recommendation.target_distance_mi, "today's recommendation"))
+            if long_run_was_yesterday:
+                out.append(DayProjection(d, d.strftime("%A"), "rest", None,
+                                          "mandatory rest — long run was yesterday"))
+            else:
+                out.append(DayProjection(d, d.strftime("%A"), recommendation.run_type,
+                                          recommendation.target_distance_mi, "today's recommendation"))
+        elif weekday == rest_weekday:
+            out.append(DayProjection(d, d.strftime("%A"), "rest", None,
+                                      "mandatory rest day after the long run"))
         elif weekday not in run_days:
             out.append(DayProjection(d, d.strftime("%A"), "rest_or_cross_training", None, ""))
         elif weekday == long_day:

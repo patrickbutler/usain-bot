@@ -3,7 +3,6 @@ from datetime import date
 import pytest
 from fastapi.testclient import TestClient
 
-from usain_bot import agent
 from usain_bot.config import load_config
 from usain_bot.garmin_adapter.mock import MockGarminAdapter
 from usain_bot.storage.local import LocalBackend
@@ -67,10 +66,13 @@ class TestTodayEndpoint:
         second = client.get("/api/today").json()
         assert first["plan_version"] == second["plan_version"]
 
-    def test_refresh_recomputes(self, client):
+    def test_refresh_recomputes_without_spamming_versions(self, client):
+        """A reprojection that changes nothing must NOT append a version —
+        otherwise real decisions get buried under no-op reloads."""
         first = client.get("/api/today").json()
         refreshed = client.post("/api/today/refresh").json()
-        assert refreshed["plan_version"] == first["plan_version"] + 1
+        assert refreshed["plan_version"] == first["plan_version"]
+        assert len(client.get("/api/plan/history").json()["versions"]) == 1
 
 
 class TestPlanEndpoint:
@@ -87,7 +89,11 @@ class TestPlanEndpoint:
 
     def test_plan_history(self, client):
         client.get("/api/today")
-        client.post("/api/today/refresh")
+        # A real change (approved revision) is what creates a second version,
+        # not a no-op reload.
+        client.post("/api/plan/revision/propose", json={
+            "pacing_mode": "ramp_asap", "rationale": "test change"})
+        client.post("/api/plan/revision/publish", json={"approval_note": "yes"})
         resp = client.get("/api/plan/history")
         versions = resp.json()["versions"]
         assert len(versions) >= 2

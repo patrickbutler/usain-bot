@@ -132,8 +132,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     next7 = project_next_7_days(
-        result.recommendation.date, config.athlete.available_run_days_per_week,
+        result.recommendation.date,
+        result.anchors.runs_per_week or config.athlete.available_run_days_per_week,
         result.plan.weeks[0].quality_sessions, result.plan.weeks[0].is_backoff, result.recommendation,
+        long_run_was_yesterday=any(
+            g.name == "rest_day_after_long_run" for g in result.recommendation.guardrail_results
+        ),
     )
 
     print(_format_text_output(result, config, next7))
