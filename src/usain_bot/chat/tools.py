@@ -166,6 +166,37 @@ def tool_validate_plan(service: CoachService, input: dict) -> dict:
     return service.get_plan_validation()
 
 
+def tool_propose_plan_revision(service: CoachService, input: dict) -> dict:
+    from ..planner import PacingMode, PlanConstraints
+
+    mode = None
+    if input.get("pacing_mode"):
+        try:
+            mode = PacingMode(str(input["pacing_mode"]))
+        except ValueError:
+            return {"error": f"pacing_mode must be one of {[m.value for m in PacingMode]}"}
+
+    constraints = PlanConstraints(
+        pacing_mode=mode,
+        max_weeks_at_peak=input.get("max_weeks_at_peak"),
+        peak_long_run_cap=input.get("peak_long_run_cap"),
+        hm_delay_weeks=input.get("hm_delay_weeks"),
+        ultra_delay_weeks=input.get("ultra_delay_weeks"),
+        run_days_per_week=input.get("run_days_per_week"),
+    )
+    if not constraints.describe():
+        return {"error": "No constraints supplied — specify at least one thing to change."}
+    return service.propose_plan_revision(constraints, str(input.get("rationale", "Athlete-requested revision")))
+
+
+def tool_publish_draft_plan(service: CoachService, input: dict) -> dict:
+    return service.publish_draft_plan(str(input.get("approval_note", "")))
+
+
+def tool_discard_draft_plan(service: CoachService, input: dict) -> dict:
+    return service.discard_draft_plan()
+
+
 def tool_clear_health_flag(service: CoachService, input: dict) -> dict:
     result = service.clear_health_flag()
     return {
@@ -346,6 +377,50 @@ TOOL_SPECS: list[ToolSpec] = [
         input_schema={"type": "object", "properties": {}},
     ),
     ToolSpec(
+        name="propose_plan_revision",
+        description=(
+            "RECOMPUTE the whole training plan under new constraints and return it as an unsaved DRAFT. "
+            "This is the tool for ANY request to change the shape of the plan — 'smooth out the ramp', "
+            "'I'm doing too many 22 mile weeks', 'cap my long runs at 20', 'build faster', 'I can only "
+            "run 3 days a week now'. It genuinely recalculates weekly mileage and long-run distances; "
+            "never claim a plan changed without calling this. "
+            "The result is NOT saved: show the athlete what changed (use the summary and diff) and ask "
+            "explicitly whether to make it official, then call publish_draft_plan only if they agree."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "rationale": {"type": "string", "description": "Why the athlete wants this, in their words — stored with the version"},
+                "pacing_mode": {
+                    "type": "string", "enum": ["milestone_smoothed", "ramp_asap"],
+                    "description": "milestone_smoothed spreads the ramp across available weeks (use when a dated goal exists or the athlete wants it gentler); ramp_asap builds as fast as safely allowed (use when no date is set)",
+                },
+                "max_weeks_at_peak": {"type": "integer", "description": "Max weeks at the peak long run before taper, e.g. 2"},
+                "peak_long_run_cap": {"type": "number", "description": "Hard cap on the longest training run, e.g. 20 or 22"},
+                "hm_delay_weeks": {"type": "integer", "description": "Push the half marathon out by N weeks"},
+                "ultra_delay_weeks": {"type": "integer", "description": "Push the 50K out by N weeks"},
+                "run_days_per_week": {"type": "integer", "description": "Running days per week to plan around"},
+            },
+        },
+    ),
+    ToolSpec(
+        name="publish_draft_plan",
+        description=(
+            "Make the pending draft plan official. ONLY call this after the athlete has explicitly "
+            "agreed to the draft you showed them — never publish without asking first. The reasoning "
+            "is stored with the new version for historical reference."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"approval_note": {"type": "string", "description": "What the athlete said when approving"}},
+        },
+    ),
+    ToolSpec(
+        name="discard_draft_plan",
+        description="Throw away the pending draft plan because the athlete rejected it or wants something different.",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
         name="clear_health_flag",
         description="Remove an active hip/back/fatigue flag (e.g. the athlete set one by mistake, or the symptom has resolved) and recompute today without the conservative cap.",
         input_schema={"type": "object", "properties": {}},
@@ -369,6 +444,9 @@ _DISPATCH: dict[str, Callable[[CoachService, dict], dict]] = {
     "push_milestone": tool_push_milestone,
     "validate_plan": tool_validate_plan,
     "clear_health_flag": tool_clear_health_flag,
+    "propose_plan_revision": tool_propose_plan_revision,
+    "publish_draft_plan": tool_publish_draft_plan,
+    "discard_draft_plan": tool_discard_draft_plan,
 }
 
 

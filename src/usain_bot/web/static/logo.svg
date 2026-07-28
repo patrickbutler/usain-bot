@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Usain Bot">
+  <title>Usain Bot</title>
+  <!-- Sprinter in the lightning-bolt pose, in Jamaican flag colours. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- rear arm, pointing down-left -->
+    <path d="M52 56 L30 66 L20 62" stroke="#8b8f94" stroke-width="7"/>
+    <!-- lead arm, pointing up-right (the signature line) -->
+    <path d="M68 44 L92 30 L104 24" stroke="#8b8f94" stroke-width="7"/>
+    <!-- torso / singlet -->
+    <path d="M50 40 L72 40 L74 74 L48 74 Z" fill="#FFD100" stroke="none"/>
+    <!-- shorts -->
+    <path d="M48 74 L74 74 L72 92 L62 92 L60 82 L58 92 L48 92 Z" fill="#111" stroke="none"/>
+    <!-- legs -->
+    <path d="M54 92 L50 108" stroke="#111" stroke-width="7"/>
+    <path d="M68 92 L76 106" stroke="#111" stroke-width="7"/>
+    <!-- head -->
+    <circle cx="60" cy="28" r="11" fill="#8b8f94" stroke="none"/>
+    <!-- visor -->
+    <path d="M52 26 L68 26" stroke="#009B3A" stroke-width="4"/>
+    <!-- bib -->
+    <rect x="54" y="52" width="16" height="11" rx="2" fill="#fff" stroke="none"/>
+    <path d="M57 57.5 L67 57.5" stroke="#009B3A" stroke-width="2.5"/>
+  </g>
+</svg>

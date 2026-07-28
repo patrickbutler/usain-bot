@@ -157,9 +157,19 @@ usain-bot serve
 
 Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, built entirely on the same `agent`/`planner`/`storage` functions as the CLI — it's a view onto the same system, not a second implementation:
 
-- **Chat** — your coach, who speaks with a Jamaican accent and plenty of slang (style only — every number, date, and safety warning still comes from the tools, stated plainly). Ask about today's run, the plan, or your history; apply overrides ("make next week easier," "push my half marathon back three weeks"); mention symptoms ("my hip's been sore") or how a run felt ("legs were dead out there") and it records both, which feeds the recommendation math directly.
-- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override), expandable to see exactly which weeks changed and how.
-- **History** — a weekly volume chart and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
+- **Chat** — your coach, who speaks with a Jamaican accent and plenty of slang (style only — every number, date, and safety warning still comes from the tools, stated plainly). Ask about today's run, the plan, or your history; apply overrides ("make next week easier," "push my half marathon back three weeks"); mention symptoms ("my hip's been sore") or how a run felt ("legs were dead out there") and it records both, which feeds the recommendation math directly. Replies render as Markdown, so tables, lists and week-by-week breakdowns are readable rather than a wall of text. The composer is a textarea that grows with your message: **Enter inserts a newline, ⌘/Ctrl+Enter (or the Send button) sends** — so a long, multi-paragraph description of a niggle doesn't fire off half-written.
+- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override, an approved plan revision), expandable to see exactly which weeks changed and how. Any plan change made in Chat re-renders this tab immediately.
+- **History** — a weekly volume chart, a **How your runs felt** section pairing every run with its 1–5 subjective score (score unrated runs inline; already-scored runs show the score and are never asked about again), and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
+
+### Jamaican mode (hidden settings page)
+
+`http://127.0.0.1:8420/settings` — deliberately not linked from the
+navigation. One toggle turns the Jamaican voice off in favour of neutral,
+professional English for demos. **Coaching is identical either way**: same
+guardrails, same tools, same numbers, only the wording changes
+(`chat/session.py` swaps `JAMAICAN_VOICE` for `PROFESSIONAL_VOICE` inside
+an otherwise identical system prompt). The page also shows which LLM
+provider and model are currently configured.
 
 Chat defaults to **OpenAI (ChatGPT)** and needs `OPENAI_API_KEY` (see `.env.example`) — every other tab works without it. **The LLM never computes a mileage, date, or guardrail value itself.** It only ever selects a tool (`chat/tools.py`) and the deterministic functions in `agent.py`/`planner.py`/`guardrails.py` do the actual math, same as every other entry point. If a tool can't answer something, the system prompt tells it to say so rather than estimate.
 
@@ -273,6 +283,69 @@ preference — surviving the plan being regenerated from anchors every
 invocation — and the planner fills the extra weeks with normal
 build/back-off weeks so your base is maintained rather than going flat.
 
+### Rest after a long run
+
+`guardrails.requires_rest_after_long_run` is a hard rule, not a
+suggestion: **the day after a long run is always off.** It enters the
+same min-across-ceilings computation as every other guardrail with a
+ceiling of 0.0 mi, so on that day the recommendation is rest and the
+binding constraint says so. The 7-day projection draws the rest day in
+the right place too, even when it lands on a normal run day.
+
+### Pacing: how fast the long run climbs
+
+Two modes, because "when is the goal?" changes the right answer:
+
+| Mode | When | Behaviour |
+|---|---|---|
+| `milestone_smoothed` (**default**) | a dated goal exists | spreads the ramp across the weeks actually available — if there are 12 miles to add over 20 build weeks it adds ~0.6/wk, not the full 1 mi/wk guardrail maximum followed by a month of idling at peak. Delays crossing 15 mi and lowers cumulative load. |
+| `ramp_asap` | no date set (e.g. the 50K) | nothing to smooth toward, so build as fast as the guardrails safely allow and reach capability sooner. |
+
+Two related ceilings run in both modes:
+
+- **Long runs past 15 mi (`HIGH_MILEAGE_LONG_RUN_MI`) are spent
+  strategically, not accumulated.** Smoothed pacing holds below that line
+  until the calendar actually requires crossing it.
+- **At most `MAX_WEEKS_AT_PEAK_LONG_RUN` (2) weeks at the peak long run.**
+  Seven consecutive 22-milers is a durability liability, not a training
+  stimulus. Once the allowance is spent the block *maintains* at 85% of
+  the peak rather than re-climbing to it — the peak is still reached, just
+  not repeated.
+
+Both are athlete-adjustable through a plan revision ("cap me at 18 miles",
+"only two weeks at the peak"), as is running frequency, which caps how
+much volume a week can absorb (one long run plus easy days at 60% of it)
+and removes the quality session below 4 days/week.
+
+### Changing the plan in conversation: draft, review, publish
+
+A plan change is a training decision, so it gets reviewed before it
+becomes the thing you train off. Asking for one in chat runs a **genuine
+recomputation** — `planner.revise_plan` re-runs the generator under the
+new constraints, it does not restaple a rationale to the same numbers —
+and holds the result as an in-memory **draft**:
+
+1. `propose_plan_revision` → recomputes, returns a before/after summary,
+   a per-week diff and a validation result. **Nothing is saved.**
+2. The coach shows you what changed and asks explicitly whether to make
+   it official.
+3. `publish_draft_plan` (only after you say yes) → saves a new plan
+   version with the reasoning and your approval note attached for
+   historical reference, and **persists the approved constraints as
+   preferences**.
+
+Step 3's last clause is the load-bearing one. The plan is regenerated
+from anchors on every invocation, so a change that isn't persisted as a
+constraint silently reverts on the next page load — which is exactly how
+"I asked chat to smooth the plan and the Upcoming tab didn't move"
+happens. `tests/test_pacing_and_drafts.py` asserts the full cycle:
+propose (version unchanged) → publish (version + 1) → force a full
+regeneration → the approved shape is still there.
+
+`discard_draft_plan` throws a draft away. The same three steps are
+available over HTTP as `POST /api/plan/revision/propose`,
+`POST /api/plan/revision/publish` and `DELETE /api/plan/revision`.
+
 ## Adapting to you
 
 - **Run frequency is derived from actuals**, not from config: distinct
@@ -280,8 +353,12 @@ build/back-off weeks so your base is maintained rather than going flat.
   days than `athlete.available_run_days_per_week` says, the plan adapts
   and the plan rationale notes the mismatch.
 - **How runs felt is remembered and used.** The coach asks about recent
-  unrated runs; you can also rate them in the Upcoming tab (1–5). A poor
-  recent average becomes a hard ceiling candidate
+  unrated runs; you can also rate them in the Upcoming tab or in
+  History → *How your runs felt* (1–5). Or just say it — "that one was
+  rough" — and the coach maps it to a score and logs it. Rating is
+  idempotent per run: a scored run shows its score and is never asked
+  about again, and re-scoring corrects the old value rather than
+  double-counting. A poor recent average becomes a hard ceiling candidate
   (`recent_run_feeling`) in the same min-across-guardrails computation as
   the load math — this is deterministic Python, not left to the LLM.
 

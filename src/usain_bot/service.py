@@ -36,6 +36,10 @@ class CoachService:
         self._lock = threading.RLock()
         self._cached: Optional[agent.InvocationResult] = None
         self._cached_flag: Optional[str] = None
+        # A proposed-but-unapproved plan revision. Held in memory only —
+        # a draft must never be mistaken for the official plan.
+        self._draft_plan: Optional[PlanVersion] = None
+        self._draft_constraints: Optional[planner.PlanConstraints] = None
 
     def get_today(self, as_of: Optional[date] = None) -> agent.InvocationResult:
         as_of = as_of or date.today()
@@ -128,6 +132,45 @@ class CoachService:
             ],
         }
 
+    def get_run_feelings_payload(self, days: int = 90, limit: int = 60) -> dict:
+        """Every run in the window paired with its subjective score, if any.
+
+        The join is done here rather than in the browser so the "already
+        rated" rule (§ never ask about a run twice) has exactly one
+        implementation: a run is rated iff a feedback entry names its date.
+        """
+        classified = self.get_history(days=days)
+        runs = [c for c in classified if c.run_class.value != "cross_training"]
+        feedback = self.storage.get_recent_run_feedback(days=days + 7, limit=500)
+        by_date: dict[date, RunFeedback] = {}
+        for f in feedback:
+            if f.activity_date is None:
+                continue
+            # Newest entry for a date wins — a re-score corrects the old one.
+            prior = by_date.get(f.activity_date)
+            if prior is None or f.timestamp >= prior.timestamp:
+                by_date[f.activity_date] = f
+
+        entries = []
+        for c in sorted(runs, key=lambda c: c.activity.date, reverse=True)[:limit]:
+            fb = by_date.get(c.activity.date)
+            entries.append({
+                "date": c.activity.date.isoformat(),
+                "run_class": c.run_class.value,
+                "distance_mi": round(c.activity.distance_mi, 2),
+                "name": c.activity.name,
+                "score": fb.score if fb else None,
+                "comment": fb.comment if fb else None,
+            })
+        rated = [e for e in entries if e["score"] is not None]
+        return {
+            "window_days": days,
+            "runs": entries,
+            "rated_count": len(rated),
+            "unrated_count": len(entries) - len(rated),
+            "mean_score": round(sum(e["score"] for e in rated) / len(rated), 2) if rated else None,
+        }
+
     def get_unrated_recent_runs(self, days: int = 10) -> list[dict]:
         """Recent runs with no feeling logged — what the coach should ask
         about. Matched by date; a run is 'rated' if any feedback entry
@@ -148,6 +191,120 @@ class CoachService:
                 "name": c.activity.name,
             })
         return out
+
+    # --- draft / publish plan revisions --------------------------------------
+
+    def propose_plan_revision(self, constraints: planner.PlanConstraints, rationale: str,
+                               as_of: Optional[date] = None) -> dict:
+        """Recompute the plan under new constraints and hold it as a DRAFT.
+
+        Nothing is persisted here — the draft lives in memory until the
+        athlete explicitly approves it. That's deliberate: a plan change is
+        a training decision, so it gets reviewed before it becomes the
+        thing the athlete trains off."""
+        as_of = as_of or date.today()
+        current = self.get_plan()
+        anchors = self.get_current_anchors(as_of)
+        base_hm = agent._read_int_preference(self.storage, agent.PREF_HM_DELAY_WEEKS)
+        base_ultra = agent._read_int_preference(self.storage, agent.PREF_ULTRA_DELAY_WEEKS)
+
+        draft = planner.revise_plan(
+            self.config, anchors, as_of,
+            version=(current.version + 1) if current else 1,
+            constraints=constraints, rationale=rationale,
+            base_hm_delay=base_hm, base_ultra_delay=base_ultra,
+        )
+        with self._lock:
+            self._draft_plan = draft
+            self._draft_constraints = constraints
+
+        marathon_goal = self.config.goal("marathon")
+        issues = validate_plan(
+            draft.weeks, date.fromisoformat(marathon_goal.date)
+        ) if marathon_goal and marathon_goal.date else []
+
+        return {
+            "draft": True,
+            "requested_changes": constraints.describe(),
+            "rationale": rationale,
+            "summary": planner.summarize_plan(draft),
+            "current_summary": planner.summarize_plan(current) if current else None,
+            "diff": planner.diff_plan_versions(current, draft),
+            "validation": {
+                "valid": not any(i.severity == "error" for i in issues),
+                "issues": [i.to_dict() for i in issues],
+            },
+            "next_step": (
+                "This is a DRAFT and has not been saved. Show the athlete what changed and ask "
+                "explicitly whether to make it official. Only call publish_draft_plan after they say yes."
+            ),
+        }
+
+    def publish_draft_plan(self, approval_note: str = "") -> dict:
+        """Promote the held draft to the official plan, recording the
+        reasoning alongside the version for historical reference."""
+        with self._lock:
+            draft = self._draft_plan
+            constraints = self._draft_constraints
+        if draft is None:
+            return {"error": "No draft plan to publish. Call propose_plan_revision first."}
+
+        current = self.get_plan()
+        draft.version = (current.version + 1) if current else 1
+        draft.diff_from_prior = planner.diff_plan_versions(current, draft)
+        detail = "; ".join(constraints.describe()) if constraints else ""
+        draft.rationale = " ".join(filter(None, [
+            draft.rationale,
+            f"Athlete-approved changes: {detail}." if detail else "",
+            f"Approval note: {approval_note}" if approval_note else "",
+        ]))
+
+        self.storage.save_plan_version(draft)
+
+        # Persist the approved shape. This is what makes the change stick:
+        # the plan is regenerated from anchors on every invocation, so
+        # without these the next page load would silently rebuild the old
+        # plan and the Upcoming tab would appear not to have changed.
+        if constraints:
+            if constraints.hm_delay_weeks is not None:
+                self.storage.set_preference(agent.PREF_HM_DELAY_WEEKS, str(constraints.hm_delay_weeks))
+            if constraints.ultra_delay_weeks is not None:
+                self.storage.set_preference(agent.PREF_ULTRA_DELAY_WEEKS, str(constraints.ultra_delay_weeks))
+            if constraints.pacing_mode is not None:
+                self.storage.set_preference(agent.PREF_PACING_MODE, constraints.pacing_mode.value)
+            if constraints.max_weeks_at_peak is not None:
+                self.storage.set_preference(agent.PREF_MAX_WEEKS_AT_PEAK, str(constraints.max_weeks_at_peak))
+            if constraints.peak_long_run_cap is not None:
+                self.storage.set_preference(agent.PREF_PEAK_LONG_RUN_CAP, str(constraints.peak_long_run_cap))
+
+        self.apply_plan_update(draft)
+        with self._lock:
+            self._draft_plan = None
+            self._draft_constraints = None
+
+        return {
+            "published": True,
+            "plan_version": draft.version,
+            "rationale": draft.rationale,
+            "diff": draft.diff_from_prior,
+            "summary": planner.summarize_plan(draft),
+            "message": f"Plan v{draft.version} is now official and live on the Upcoming tab.",
+        }
+
+    def discard_draft_plan(self) -> dict:
+        with self._lock:
+            had = self._draft_plan is not None
+            self._draft_plan = None
+            self._draft_constraints = None
+        return {"discarded": had}
+
+    def get_draft_plan_payload(self) -> Optional[dict]:
+        with self._lock:
+            draft = self._draft_plan
+        if draft is None:
+            return None
+        return {"version_if_published": draft.version, "summary": planner.summarize_plan(draft),
+                "weeks": [w.to_dict() for w in draft.weeks]}
 
     # --- milestone scheduling preferences ------------------------------------
 
@@ -199,8 +356,11 @@ class CoachService:
         rec = result.recommendation
         plan = result.plan
         next7 = project_next_7_days(
-            rec.date, self.config.athlete.available_run_days_per_week,
+            rec.date, result.anchors.runs_per_week or self.config.athlete.available_run_days_per_week,
             plan.weeks[0].quality_sessions, plan.weeks[0].is_backoff, rec,
+            long_run_was_yesterday=any(
+                g.name == "rest_day_after_long_run" for g in rec.guardrail_results
+            ),
         )
         return {
             "recommendation": rec.to_dict(),

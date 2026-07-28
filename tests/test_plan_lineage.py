@@ -6,7 +6,7 @@ from usain_bot import agent
 from usain_bot.config import load_config
 from usain_bot.garmin_adapter.mock import MockGarminAdapter
 from usain_bot.models import Anchors, GapInfo, GapSeverity
-from usain_bot.planner import WeekDiff, diff_plan_versions, diff_plan_weeks, generate_macro_plan
+from usain_bot.planner import diff_plan_versions, diff_plan_weeks, generate_macro_plan
 from usain_bot.service import CoachService
 from usain_bot.storage.local import LocalBackend
 

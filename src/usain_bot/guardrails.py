@@ -201,6 +201,25 @@ def should_insert_backoff_week(weeks_since_last_backoff: int, cadence: int = DEF
 
 # --- 5.6 general safety rules --------------------------------------------------
 
+REST_DAYS_AFTER_LONG_RUN = 1
+
+
+def requires_rest_after_long_run(days_since_last_long_run: Optional[int]) -> bool:
+    """Hard rule: at least one full day off after a long run.
+
+    `days_since_last_long_run` is 0 when the long run was today and 1 when
+    it was yesterday — so this returns True only for the day immediately
+    following. None (no long run on record) is never a rest trigger.
+
+    This is a floor, not a suggestion: it binds regardless of how fresh
+    the athlete feels or what the load math would otherwise permit, which
+    is why it lives here with the other non-negotiables rather than in
+    the planner's projection."""
+    if days_since_last_long_run is None:
+        return False
+    return 0 < days_since_last_long_run <= REST_DAYS_AFTER_LONG_RUN
+
+
 def max_quality_sessions_per_week(is_return_from_gap_rebuild: bool) -> int:
     return 0 if is_return_from_gap_rebuild else 2
 

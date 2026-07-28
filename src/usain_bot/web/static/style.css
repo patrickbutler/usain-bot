@@ -1,47 +1,60 @@
 :root {
-  --bg: #f6f5f2;
+  /* Jamaican flag palette: green #009B3A, gold #FFD100, black #000000.
+     Surfaces stay near-neutral so the flag colours read as accents rather
+     than swamping the data — mileage numbers must stay legible. */
+  --jam-green: #009B3A;
+  --jam-gold: #FFD100;
+  --jam-black: #101010;
+
+  --bg: #f5f7f4;
   --surface: #ffffff;
-  --surface-2: #f0eee9;
-  --border: #e2ded5;
-  --text: #201e1a;
-  --text-muted: #6b6558;
-  --accent: #b5502f;
-  --accent-soft: #f2ded4;
-  --green: #3f7d4f;
-  --yellow: #a97a1f;
-  --red: #b3402f;
-  --chip-bg: #efece5;
-  --shadow: 0 1px 2px rgba(30, 25, 15, 0.06), 0 1px 8px rgba(30, 25, 15, 0.04);
+  --surface-2: #eef2ec;
+  --border: #d7e0d6;
+  --text: #12180f;
+  --text-muted: #5b6659;
+  --accent: #00702a;            /* darkened green: 4.5:1+ on white */
+  --accent-soft: #dcf0e2;
+  --gold: #8a6d00;              /* darkened gold for text on light bg */
+  --gold-soft: #fff4cc;
+  --green: #00702a;
+  --yellow: #8a6d00;
+  --red: #b3271f;
+  --chip-bg: #e8efe7;
+  --shadow: 0 1px 2px rgba(10, 30, 15, 0.06), 0 1px 8px rgba(10, 30, 15, 0.05);
   --radius: 14px;
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #171512;
-    --surface: #201d19;
-    --surface-2: #262220;
-    --border: #35302a;
-    --text: #ece7de;
-    --text-muted: #a49c8c;
-    --accent: #e08159;
-    --accent-soft: #3a2620;
-    --green: #6fbf7f;
-    --yellow: #d7a94a;
-    --red: #e0725c;
-    --chip-bg: #2a2620;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 10px rgba(0, 0, 0, 0.25);
+    --bg: #0d110c;
+    --surface: #151b14;
+    --surface-2: #1c231b;
+    --border: #2b342a;
+    --text: #e8f0e6;
+    --text-muted: #9aa898;
+    --accent: #2fd167;          /* brightened green for dark surfaces */
+    --accent-soft: #16301f;
+    --gold: #FFD100;
+    --gold-soft: #3a3212;
+    --green: #2fd167;
+    --yellow: #FFD100;
+    --red: #ff7a6b;
+    --chip-bg: #1f271e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 10px rgba(0, 0, 0, 0.3);
   }
 }
 :root[data-theme="dark"] {
-  --bg: #171512; --surface: #201d19; --surface-2: #262220; --border: #35302a;
-  --text: #ece7de; --text-muted: #a49c8c; --accent: #e08159; --accent-soft: #3a2620;
-  --green: #6fbf7f; --yellow: #d7a94a; --red: #e0725c; --chip-bg: #2a2620;
+  --bg: #0d110c; --surface: #151b14; --surface-2: #1c231b; --border: #2b342a;
+  --text: #e8f0e6; --text-muted: #9aa898; --accent: #2fd167; --accent-soft: #16301f;
+  --gold: #FFD100; --gold-soft: #3a3212;
+  --green: #2fd167; --yellow: #FFD100; --red: #ff7a6b; --chip-bg: #1f271e;
 }
 :root[data-theme="light"] {
-  --bg: #f6f5f2; --surface: #ffffff; --surface-2: #f0eee9; --border: #e2ded5;
-  --text: #201e1a; --text-muted: #6b6558; --accent: #b5502f; --accent-soft: #f2ded4;
-  --green: #3f7d4f; --yellow: #a97a1f; --red: #b3402f; --chip-bg: #efece5;
+  --bg: #f5f7f4; --surface: #ffffff; --surface-2: #eef2ec; --border: #d7e0d6;
+  --text: #12180f; --text-muted: #5b6659; --accent: #00702a; --accent-soft: #dcf0e2;
+  --gold: #8a6d00; --gold-soft: #fff4cc;
+  --green: #00702a; --yellow: #8a6d00; --red: #b3271f; --chip-bg: #e8efe7;
 }
 
 * { box-sizing: border-box; }
@@ -54,6 +67,13 @@ body {
   overflow-x: hidden;
 }
 
+/* Jamaican flag stripe across the very top of the app. */
+.flag-stripe {
+  height: 4px;
+  background: linear-gradient(90deg,
+    var(--jam-green) 0 33.33%, var(--jam-gold) 33.33% 66.66%, var(--jam-black) 66.66% 100%);
+}
+
 .topbar {
   display: flex;
   align-items: center;
@@ -63,8 +83,11 @@ body {
   background: var(--surface);
   flex-wrap: wrap;
 }
-.brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 1.05rem; }
-.brand-mark { font-size: 1.2rem; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 1.05rem; letter-spacing: -0.01em; }
+.brand-logo { width: 34px; height: 34px; flex-shrink: 0; }
+.brand-name { display: flex; flex-direction: column; line-height: 1.05; }
+.brand-name b { font-size: 1rem; }
+.brand-name span { font-size: 0.62rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; }
 
 .tabs { display: flex; gap: 4px; background: var(--surface-2); padding: 4px; border-radius: 10px; }
 .tab {
@@ -72,7 +95,10 @@ body {
   padding: 7px 14px; border-radius: 8px; font-size: 0.9rem; cursor: pointer;
   font-family: inherit; font-weight: 600;
 }
-.tab.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+.tab.active {
+  background: var(--accent); color: #fff; box-shadow: var(--shadow);
+}
+:root[data-theme="dark"] .tab.active { color: #06210f; }
 
 .status-pill {
   margin-left: auto; font-size: 0.78rem; color: var(--text-muted);
@@ -115,12 +141,49 @@ select { border: 1px solid var(--border); background: var(--surface-2); color: v
 .msg { display: flex; }
 .msg.user { justify-content: flex-end; }
 .bubble {
-  max-width: 78%; padding: 10px 14px; border-radius: 14px; font-size: 0.92rem; line-height: 1.45;
-  white-space: pre-wrap;
+  max-width: 82%; padding: 10px 14px; border-radius: 14px; font-size: 0.92rem; line-height: 1.5;
+  overflow-wrap: anywhere;
 }
-.msg.agent .bubble { background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+/* Plain-text bubbles (the user's own words) keep their line breaks;
+   rendered-markdown bubbles must NOT, or every block gains blank lines. */
+.bubble.plain { white-space: pre-wrap; }
+.msg.agent .bubble {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-bottom-left-radius: 4px; border-left: 3px solid var(--accent);
+}
 .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+:root[data-theme="dark"] .msg.user .bubble { color: #06210f; }
 .msg.tool-note .bubble { background: transparent; border: 1px dashed var(--border); color: var(--text-muted); font-size: 0.78rem; }
+
+/* --- rendered markdown inside chat bubbles --- */
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+/* Markdown headings are shifted down two levels when rendered (# -> h3),
+   so h1/h2 stay reserved for the app chrome — style the whole range. */
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.7em 0 0.35em; line-height: 1.25; font-weight: 700; }
+.md h3 { font-size: 1.08rem; } .md h4 { font-size: 1.02rem; } .md h5 { font-size: 0.97rem; }
+.md h6 { font-size: 0.93rem; color: var(--text-muted); }
+.md p { margin: 0.5em 0; }
+.md ul, .md ol { margin: 0.5em 0; padding-left: 1.35em; }
+.md li { margin: 0.2em 0; }
+.md code {
+  background: var(--chip-bg); padding: 1px 5px; border-radius: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em;
+}
+.md pre {
+  background: var(--chip-bg); padding: 10px 12px; border-radius: 8px;
+  overflow-x: auto; margin: 0.6em 0;
+}
+.md pre code { background: none; padding: 0; }
+.md blockquote {
+  margin: 0.6em 0; padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--gold); color: var(--text-muted);
+}
+.md table { margin: 0.6em 0; font-size: 0.85rem; display: block; overflow-x: auto; }
+.md th, .md td { padding: 5px 9px; }
+.md a { color: var(--accent); }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+.md strong { font-weight: 700; }
 
 .quick-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 .quick-actions button {
@@ -130,19 +193,27 @@ select { border: 1px solid var(--border); background: var(--surface-2); color: v
 .quick-actions button:hover { border-color: var(--accent); color: var(--accent); }
 
 .chat-input-row {
-  display: flex; gap: 8px; padding: 12px; background: var(--surface);
+  display: flex; gap: 8px; padding: 12px; background: var(--surface); align-items: flex-end;
   border: 1px solid var(--border); border-top: none; border-radius: 0 0 var(--radius) var(--radius);
 }
+/* Auto-growing composer: starts one line, expands with the message, and
+   scrolls internally past max-height rather than pushing the page around. */
 #chat-input {
   flex: 1; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
   border-radius: 10px; padding: 10px 12px; font-family: inherit; font-size: 0.92rem;
+  line-height: 1.45; resize: none; overflow-y: auto;
+  min-height: 42px; max-height: 220px;
 }
+#chat-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 #chat-send {
   border: none; background: var(--accent); color: #fff; padding: 10px 18px;
-  border-radius: 10px; font-weight: 600; cursor: pointer; font-family: inherit;
+  border-radius: 10px; font-weight: 700; cursor: pointer; font-family: inherit;
+  align-self: stretch; min-height: 42px;
 }
+:root[data-theme="dark"] #chat-send { color: #06210f; }
 #chat-send:disabled { opacity: 0.5; cursor: default; }
 .chat-note { text-align: center; color: var(--text-muted); font-size: 0.78rem; min-height: 1.2em; margin: 8px 0 0; }
+.send-hint { font-size: 0.68rem; color: var(--text-muted); text-align: right; padding: 0 14px 8px; background: var(--surface); border-left: 1px solid var(--border); border-right: 1px solid var(--border); margin: 0; }
 
 /* --- Upcoming --- */
 .rec-headline { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
@@ -187,6 +258,18 @@ tr.backoff { background: var(--surface-2); }
 }
 .score-btn:hover { border-color: var(--accent); color: var(--accent); }
 .score-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* An already-scored run shows its score instead of the buttons — the coach
+   never asks about a run twice. */
+.score-chip {
+  margin-left: auto; padding: 3px 10px; border-radius: 999px; font-size: 0.75rem;
+  font-weight: 700; background: var(--chip-bg); white-space: nowrap;
+}
+.score-chip.score-1, .score-chip.score-2 { color: var(--red); background: color-mix(in srgb, var(--red) 16%, var(--chip-bg)); }
+.score-chip.score-3 { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 18%, var(--chip-bg)); }
+.score-chip.score-4, .score-chip.score-5 { color: var(--green); background: color-mix(in srgb, var(--green) 18%, var(--chip-bg)); }
+.feelings-scroll { max-height: 420px; overflow-y: auto; }
+.feeling-row.rated .day-dist { font-weight: 400; color: var(--text-muted); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .valid-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.03em; }
 .valid-badge.ok { background: color-mix(in srgb, var(--green) 20%, var(--chip-bg)); color: var(--green); }
@@ -238,3 +321,24 @@ tr.backoff { background: var(--surface-2); }
 .class-long { color: var(--accent); font-weight: 700; }
 .class-quality { color: var(--red); }
 .class-recovery { color: var(--text-muted); }
+
+/* --- settings page --- */
+.setting-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 10px 0; }
+.setting-title { font-weight: 700; margin-bottom: 4px; }
+.toggle {
+  flex-shrink: 0; width: 52px; height: 30px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-2); position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.toggle .toggle-knob {
+  position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--text-muted); transition: transform 0.15s ease, background 0.15s ease;
+}
+.toggle.on { background: var(--accent); border-color: var(--accent); }
+.toggle.on .toggle-knob { transform: translateX(22px); background: #fff; }
+.toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+kbd {
+  background: var(--chip-bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 0 4px; font-family: inherit; font-size: 0.9em;
+}

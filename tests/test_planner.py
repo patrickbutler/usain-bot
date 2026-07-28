@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import pytest
 
@@ -34,9 +34,19 @@ def warm_anchors() -> Anchors:
 class TestGenerateMacroPlan:
     def test_uses_config_baseline_at_cold_start(self, config, cold_start_anchors):
         plan = generate_macro_plan(config, cold_start_anchors, date(2026, 7, 24), 1, "first_run", "test")
-        # Week 1 is a build week, so it's the baseline plus one increment —
-        # not the flat baseline itself — but it must be *derived from* the
-        # configured baseline, not an arbitrarily larger/smaller number.
+        # Week 1 must be *derived from* the configured baseline. Under the
+        # default smoothed pacing it does NOT take the full guardrail
+        # increment straight away — that's the point of smoothing — so the
+        # assertion is a range: at least the baseline, at most one increment
+        # above it.
+        baseline = config.athlete.baseline_long_run_mi
+        assert baseline <= plan.weeks[0].long_run_mi <= gr.next_long_run_distance(baseline) + 1e-6
+
+    def test_ramp_asap_takes_the_full_increment_immediately(self, config, cold_start_anchors):
+        from usain_bot.planner import PacingMode
+
+        plan = generate_macro_plan(config, cold_start_anchors, date(2026, 7, 24), 1, "first_run", "test",
+                                    pacing_mode=PacingMode.RAMP_ASAP)
         expected = gr.next_long_run_distance(config.athlete.baseline_long_run_mi)
         assert plan.weeks[0].long_run_mi == pytest.approx(expected)
 

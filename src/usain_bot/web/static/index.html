@@ -4,13 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>usain-bot</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<div class="flag-stripe"></div>
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark">🏃</span>
-    <span class="brand-name">usain-bot</span>
+    <img class="brand-logo" src="/static/logo.svg" alt="Usain Bot logo" />
+    <span class="brand-name"><b>Usain Bot</b><span>Agentic Running Coach</span></span>
   </div>
   <nav class="tabs" role="tablist">
     <button class="tab active" data-tab="chat" role="tab" aria-selected="true">Chat</button>
@@ -35,9 +37,10 @@
         <button data-quick="My hip is bothering me">My hip is bothering me</button>
       </div>
       <form id="chat-form" class="chat-input-row">
-        <input id="chat-input" type="text" placeholder="Ask usain-bot…" autocomplete="off" />
+        <textarea id="chat-input" rows="1" placeholder="Ask Usain Bot…  (Enter for a new line)"></textarea>
         <button type="submit" id="chat-send">Send</button>
       </form>
+      <p class="send-hint">Enter = new line · <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd> = send</p>
       <p class="chat-note" id="chat-note"></p>
     </div>
   </section>
@@ -109,6 +112,14 @@
           </div>
         </div>
         <div id="history-chart" class="loading">Loading…</div>
+      </div>
+
+      <div class="card wide">
+        <div class="card-header">
+          <h2>How your runs felt</h2>
+          <span class="hint-text">Score any run 1-5 — or just tell the coach in chat and it scores it for you</span>
+        </div>
+        <div id="history-feelings" class="loading">Loading…</div>
       </div>
 
       <div class="card wide">

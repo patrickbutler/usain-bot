@@ -30,7 +30,15 @@ from .models import (
     Recommendation,
     RunClass,
 )
-from .planner import OverrideResult, apply_override, diff_plan_versions, generate_macro_plan
+from .planner import (
+    OverrideResult,
+    PacingMode,
+    PlanConstraints,
+    apply_override,
+    diff_plan_versions,
+    diff_plan_weeks,
+    generate_macro_plan,
+)
 from .storage.base import StorageBackend
 
 logger = logging.getLogger("usain_bot.agent")
@@ -42,6 +50,45 @@ HEALTH_FLAG_CAP_FACTOR = 0.85
 # from anchors every invocation and would otherwise forget them).
 PREF_HM_DELAY_WEEKS = "hm_delay_weeks"
 PREF_ULTRA_DELAY_WEEKS = "ultra_delay_weeks"
+
+# Approved plan-shape constraints. These MUST persist: the plan is
+# regenerated from anchors on every invocation, so without them an
+# athlete-approved revision would be silently overwritten by the next
+# page load — which is exactly the "I changed the plan in chat and the
+# Upcoming tab didn't move" failure.
+PREF_PACING_MODE = "pacing_mode"
+PREF_MAX_WEEKS_AT_PEAK = "max_weeks_at_peak"
+PREF_PEAK_LONG_RUN_CAP = "peak_long_run_cap"
+
+
+def _read_float_preference(storage: StorageBackend, key: str) -> Optional[float]:
+    raw = storage.get_preference(key)
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def read_plan_constraints(storage: StorageBackend) -> PlanConstraints:
+    """Rebuild the athlete's approved plan shape from persisted
+    preferences, so every regeneration reproduces it."""
+    raw_mode = storage.get_preference(PREF_PACING_MODE)
+    try:
+        mode = PacingMode(raw_mode) if raw_mode else None
+    except ValueError:
+        mode = None
+    max_peak = storage.get_preference(PREF_MAX_WEEKS_AT_PEAK)
+    try:
+        max_peak_val = int(max_peak) if max_peak is not None else None
+    except (TypeError, ValueError):
+        max_peak_val = None
+
+    return PlanConstraints(
+        pacing_mode=mode,
+        max_weeks_at_peak=max_peak_val,
+        peak_long_run_cap=_read_float_preference(storage, PREF_PEAK_LONG_RUN_CAP),
+    )
+
 
 # Subjective-state bias: when recent runs have felt bad, cap today below
 # what the physical guardrails alone would allow. 1=awful .. 5=great.
@@ -245,6 +292,16 @@ def _this_week_classified(classified: list[ClassifiedActivity], as_of: date) -> 
     return [c for c in classified if ws <= c.activity.date < as_of]
 
 
+def _days_since_last_long_run(classified: list[ClassifiedActivity], as_of: date) -> Optional[int]:
+    """Whole days between the most recent long run and `as_of`. None when
+    no long run is on record."""
+    long_dates = [
+        c.activity.date for c in classified
+        if c.run_class == RunClass.LONG and c.activity.date <= as_of
+    ]
+    return (as_of - max(long_dates)).days if long_dates else None
+
+
 def _recent_easy_distance(classified: list[ClassifiedActivity], as_of: date, fallback: float) -> float:
     dists = [
         c.activity.distance_mi for c in classified
@@ -306,6 +363,20 @@ def compute_recommendation(
     )
 
     candidates: list[GuardrailResult] = []
+
+    # Hard rule: at least one full day off after a long run. Applied before
+    # anything else and never negotiable — a rested day is what makes the
+    # long run productive rather than cumulative damage.
+    days_since_long = _days_since_last_long_run(classified, as_of)
+    if gr.requires_rest_after_long_run(days_since_long):
+        candidates.append(GuardrailResult(
+            "rest_day_after_long_run", 0.0,
+            "Long run was yesterday. At least one full day off after a long run is a hard rule — "
+            "today is a rest day (cross-training or mobility is fine).",
+        ))
+        reasoning.append(
+            "Mandatory rest: yesterday was a long run, so today is off regardless of how good you feel."
+        )
 
     # Cold start: no training history at all (new athlete, or Garmin has
     # never synced). Every load-derived cap is 0 here, which would
@@ -404,7 +475,7 @@ def compute_recommendation(
             _recent_easy_distance(classified, as_of, fallback=3.0) * HEALTH_FLAG_CAP_FACTOR
         candidates.append(GuardrailResult(
             f"health_flag_{health_flag}", flag_cap,
-            f"Health flag active: capped below last completed distance as a precaution.",
+            f"'{health_flag}' flag active: capped below last completed distance as a precaution.",
         ))
 
     # Subjective state: how recent runs actually FELT is a real signal the
@@ -580,7 +651,18 @@ def run_invocation(
     ultra_delay = _read_int_preference(storage, PREF_ULTRA_DELAY_WEEKS)
     run_days = anchors.runs_per_week or config.athlete.available_run_days_per_week
 
-    plan_kwargs = dict(hm_delay_weeks=hm_delay, ultra_delay_weeks=ultra_delay, run_days_per_week=run_days)
+    # Honor the athlete's approved plan shape. Without this the regenerated
+    # plan would ignore an approved revision and the Upcoming tab would snap
+    # back to the generator's defaults.
+    approved = read_plan_constraints(storage)
+    from .planner import MAX_WEEKS_AT_PEAK_LONG_RUN, PacingMode
+
+    plan_kwargs = dict(
+        hm_delay_weeks=hm_delay, ultra_delay_weeks=ultra_delay, run_days_per_week=run_days,
+        pacing_mode=approved.pacing_mode or PacingMode.MILESTONE_SMOOTHED,
+        max_weeks_at_peak=approved.max_weeks_at_peak or MAX_WEEKS_AT_PEAK_LONG_RUN,
+        peak_long_run_cap=approved.peak_long_run_cap,
+    )
 
     if action.regenerate_plan:
         trigger = "gap_regeneration"
@@ -616,10 +698,20 @@ def run_invocation(
     # daily reprojections with no record of what actually changed.
     plan.diff_from_prior = diff_plan_versions(prior_plan, plan)
 
+    # A reprojection that changes nothing is not a new plan. Without this,
+    # every page load appended a version whose diff read "(no material
+    # changes)", burying the handful of versions that represent real
+    # decisions under dozens of no-ops.
+    plan_is_unchanged = prior_plan is not None and not any(
+        d.change_type != "unchanged" for d in diff_plan_weeks(prior_plan, plan)
+    )
+    if plan_is_unchanged:
+        plan = prior_plan
+
     recommendation = compute_recommendation(config, storage, classified, anchors, plan, as_of, health_flag)
     _log_decision(recommendation)
 
-    if not dry_run:
+    if not dry_run and not plan_is_unchanged:
         storage.save_plan_version(plan)
         storage.save_conversation_entry(ConversationEntry(
             timestamp=datetime.utcnow(), role="agent",
