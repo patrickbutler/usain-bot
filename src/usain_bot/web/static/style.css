@@ -84,7 +84,15 @@ body {
   flex-wrap: wrap;
 }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 1.05rem; letter-spacing: -0.01em; }
-.brand-logo { width: 34px; height: 34px; flex-shrink: 0; }
+/* logo.png is a square 1024x1024 asset with the full character pose PLUS a
+   "USAIN BOT" wordmark baked in below it (illegible at header size and
+   redundant with .brand-name next to it). This wrapper crops to just the
+   character: the fixed pixel offsets are the character's alpha bounding
+   box (x 190-877, y 167-647 of the 1024px source) scaled to a 40px-tall
+   header logo — not arbitrary, so keep both numbers in sync if the source
+   image or header height ever changes. */
+.brand-logo-crop { width: 57px; height: 40px; overflow: hidden; position: relative; flex-shrink: 0; display: block; }
+.brand-logo { position: absolute; width: 85px; height: 85px; left: -16px; top: -14px; max-width: none; }
 .brand-name { display: flex; flex-direction: column; line-height: 1.05; }
 .brand-name b { font-size: 1rem; }
 .brand-name span { font-size: 0.62rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; }

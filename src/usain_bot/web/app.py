@@ -275,6 +275,6 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
         def favicon():
             """Browsers request this unprompted; serving the logo keeps a
             404 out of the console."""
-            return FileResponse(str(STATIC_DIR / "logo.svg"), media_type="image/svg+xml")
+            return FileResponse(str(STATIC_DIR / "logo.png"), media_type="image/png")
 
     return app
