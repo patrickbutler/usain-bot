@@ -108,6 +108,10 @@ class PlanWeek:
     quality_sessions: int
     is_backoff: bool
     notes: str = ""
+    # Which training stage this week belongs to (see stages.TrainingStage).
+    # Defaults to empty so plan versions saved before stages existed still
+    # deserialize; stages.classify_plan backfills them on read.
+    stage: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +123,7 @@ class PlanWeek:
             "quality_sessions": self.quality_sessions,
             "is_backoff": self.is_backoff,
             "notes": self.notes,
+            "stage": self.stage,
         }
 
 

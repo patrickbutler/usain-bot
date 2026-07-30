@@ -172,9 +172,12 @@ class TestPacingModes:
             pacing_mode=PacingMode.MILESTONE_SMOOTHED))
         assert default == smoothed
 
-    def test_max_weeks_at_peak_is_respected(self, config, warm_anchors):
-        plan = generate_macro_plan(config, warm_anchors, AS_OF, 1, "test", "test", max_weeks_at_peak=2)
-        assert summarize_plan(plan)["weeks_at_peak_long_run"] <= 2
+    def test_peak_weeks_are_never_consecutive(self, config, warm_anchors):
+        """The hard rule. Touching the peak repeatedly is the maintain
+        stage working as designed; touching it twice in a row is the
+        injury pattern it exists to prevent."""
+        plan = generate_macro_plan(config, warm_anchors, AS_OF, 1, "test", "test")
+        assert summarize_plan(plan)["max_consecutive_peak_weeks"] <= 1
 
     def test_peak_long_run_cap_is_respected(self, config, warm_anchors):
         plan = generate_macro_plan(config, warm_anchors, AS_OF, 1, "test", "test", peak_long_run_cap=16.0)
@@ -261,17 +264,17 @@ class TestDraftPlanRevision:
 
 class TestDraftPublishSurvivesRegeneration:
     def test_published_shape_is_not_regenerated_away(self, service):
-        """The exact failure the athlete reported: ask for fewer weeks at
-        the peak, get told it's done, then reload and find the old plan."""
+        """The exact failure the athlete reported: ask for a lower peak,
+        get told it's done, then reload and find the old plan."""
         service.get_today(as_of=AS_OF)
-        before = summarize_plan(service.get_plan())["weeks_at_peak_long_run"]
+        before = summarize_plan(service.get_plan())["peak_long_run_mi"]
 
         service.propose_plan_revision(
-            PlanConstraints(max_weeks_at_peak=2, peak_long_run_cap=16.0), "smooth it", as_of=AS_OF)
+            PlanConstraints(peak_long_run_cap=16.0), "smooth it", as_of=AS_OF)
         service.publish_draft_plan("yes, make it official")
         published = summarize_plan(service.get_plan())
-        assert published["weeks_at_peak_long_run"] <= 2
         assert published["peak_long_run_mi"] <= 16.0
+        assert published["max_consecutive_peak_weeks"] <= 1
 
         # Force a full regeneration — this is what a page reload the next
         # day does. The approved constraints must be read back from
@@ -279,9 +282,9 @@ class TestDraftPublishSurvivesRegeneration:
         service._cached = None
         service.refresh_today(as_of=AS_OF)
         after = summarize_plan(service.get_plan())
-        assert after["weeks_at_peak_long_run"] <= 2
         assert after["peak_long_run_mi"] <= 16.0
-        assert before >= after["weeks_at_peak_long_run"]
+        assert after["max_consecutive_peak_weeks"] <= 1
+        assert before > after["peak_long_run_mi"]
 
     def test_constraints_are_persisted_as_preferences(self, service, storage):
         service.get_today(as_of=AS_OF)

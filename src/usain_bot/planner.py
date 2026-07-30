@@ -40,6 +40,7 @@ from enum import Enum
 from typing import Optional
 
 from . import guardrails as gr
+from . import stages
 from .config import Config
 from .models import Anchors, PlanVersion, PlanWeek
 
@@ -56,24 +57,27 @@ MARATHON_LONG_RUN_MAX_MI = 22.0
 ULTRA_DISTANCE_MI = 31.1
 ULTRA_PREREQ_WEEKLY_MI = 30.0
 ULTRA_PREREQ_CONSECUTIVE_WEEKS = 3
-ULTRA_TAPER_WEEKS = 2           # valid range 2-3
+# Ultra taper length lives in milestones.MILESTONE_PREP (and its valid
+# range in validation.ULTRA_TAPER_RANGE); a duplicate constant here would
+# look authoritative while controlling nothing.
 ULTRA_LONG_RUN_MAX_MI = 24.0
 ULTRA_VOLUME_CAP_MI = 38.0
 
 # Long runs past this distance carry disproportionate injury risk, so
 # they're spent strategically rather than accumulated: under smoothed
 # pacing the schedule stays below this line until the calendar actually
-# requires crossing it.
-HIGH_MILEAGE_LONG_RUN_MI = 15.0
+# requires crossing it. Owned by stages.py — re-exported here because
+# planner is the module most callers already import, and two independent
+# definitions of the same injury threshold would eventually drift apart.
+HIGH_MILEAGE_LONG_RUN_MI = stages.HIGH_MILEAGE_LONG_RUN_MI
 
 # Ceiling on how many weeks may sit at (or near) the peak long run before
 # a taper. Seven consecutive 22-milers is a durability liability, not a
-# training stimulus — the peak is a sharpening tool, not a plateau.
+# training stimulus — the peak is a sharpening tool, not a plateau. This is
+# now enforced structurally: reaching the peak ends the increase stage and
+# hands over to the maintain cycle (stages.py), which places at most one
+# peak week per cycle and never two in a row.
 MAX_WEEKS_AT_PEAK_LONG_RUN = 2
-PEAK_PROXIMITY_MI = 1.0        # within this of peak counts as "at peak"
-# Once the allowance is spent, later weeks in the block hold the long run
-# here (a fraction of the ceiling) instead of stacking another peak.
-PEAK_STEPDOWN_FACTOR = 0.85
 
 
 class PacingMode(str, Enum):
@@ -138,38 +142,24 @@ def scheduled_long_run(
     return baseline_lr + (target_lr - baseline_lr) * progress
 
 
-@dataclass
-class _PeakAllowance:
-    """How many weeks a build block may spend at (or within
-    PEAK_PROXIMITY_MI of) its long-run ceiling.
+def _weeks_needed_to_climb(baseline_lr: float, target_lr: float, cadence: int) -> int:
+    """Build weeks required to climb from `baseline_lr` to `target_lr` at
+    the guardrail increment, inflated for the back-off weeks in between.
 
-    Peak long runs are a sharpening tool, not a plateau: once the
-    allowance is spent the block holds the long run below the peak rather
-    than stacking another one. This is what stops "22 miles every week
-    for seven weeks" — the ceiling is still reached, just not repeatedly.
+    This bounds how long the increase stage may last. Without it, smoothing
+    happily spreads a 2-mile climb across five months, and the athlete
+    spends that entire time running long — the plateau this system exists
+    to avoid, just at a slightly lower number.
     """
-
-    ceiling: float
-    max_weeks: Optional[int] = MAX_WEEKS_AT_PEAK_LONG_RUN
-    used: int = 0
-
-    @property
-    def stepdown_mi(self) -> float:
-        return round(self.ceiling * PEAK_STEPDOWN_FACTOR, 2)
-
-    def limit(self, lr: float) -> float:
-        if self.max_weeks is None:
-            return lr
-        # Once spent, the block *maintains* below the peak rather than
-        # re-climbing to it: a ratchet back up would just produce another
-        # near-peak week every couple of weeks, which is the pattern this
-        # allowance exists to prevent.
-        if self.used >= self.max_weeks:
-            return min(lr, self.stepdown_mi)
-        if lr < self.ceiling - PEAK_PROXIMITY_MI:
-            return lr
-        self.used += 1
-        return lr
+    if target_lr <= baseline_lr:
+        return 1
+    weeks, lr = 0, baseline_lr
+    while lr < target_lr - 1e-6 and weeks < _MAX_PLAN_WEEKS:
+        lr += gr.long_run_increment(lr)
+        weeks += 1
+    # Back-off weeks don't advance the long run, so the calendar cost is
+    # higher than the number of climbing weeks.
+    return max(1, round(weeks * (cadence + 1) / max(cadence, 1)))
 
 
 @dataclass
@@ -180,23 +170,30 @@ class _BuildState:
     peak_vol: float
     weeks_since_backoff: int = 0
 
-    def build_week(self, lr_cap: float, vol_cap: float, scheduled_lr: Optional[float] = None,
-                   allowance: Optional[_PeakAllowance] = None) -> tuple[float, float]:
-        """One build week. The long run rises by at most the §5.1 guardrail
-        increment (min(1mi, 10%)), and — when `scheduled_lr` is supplied by
-        smoothed pacing — no further than the calendar actually requires.
-        Volume grows toward lr/TARGET_SHARE, at most +10%/week, never
-        shrinking.
+    def build_week(self, lr_cap: float, vol_cap: float,
+                   scheduled_lr: Optional[float] = None,
+                   increment_scale: float = 1.0) -> tuple[float, float]:
+        """One INCREASE_MILEAGE week. The long run rises by at most the §5.1
+        guardrail increment (min(1mi, 10%)), and — when `scheduled_lr` is
+        supplied by smoothed pacing — no further than the calendar actually
+        requires. Volume grows toward lr/TARGET_SHARE, at most +10%/week,
+        never shrinking.
 
         `scheduled_lr` is a ceiling, never a floor: it can hold the long run
         flat but can never push it up faster than the injury guardrail.
-        `allowance` caps how many weeks may sit at the peak."""
-        guardrail_ceiling = self.lr + gr.long_run_increment(self.lr)
+
+        Holding *at* the peak is not this function's job — reaching `lr_cap`
+        ends the increase stage and the maintain cycle takes over
+        (stages.stage_targets), which is what keeps peak weeks apart.
+
+        `increment_scale` < 1 shrinks the weekly step ("ramp up slower").
+        It is clamped at 1.0 so it can only ever be more conservative than
+        the guardrail, never less."""
+        step = gr.long_run_increment(self.lr) * min(max(increment_scale, 0.05), 1.0)
+        guardrail_ceiling = self.lr + step
         next_lr = min(guardrail_ceiling, lr_cap)
         if scheduled_lr is not None:
             next_lr = min(next_lr, max(scheduled_lr, self.lr))
-        if allowance is not None:
-            next_lr = allowance.limit(next_lr)
 
         target_vol = next_lr / TARGET_LONG_RUN_SHARE
         next_vol = min(max(self.vol, min(target_vol, self.vol * gr.WEEKLY_VOLUME_GROWTH_FACTOR)), vol_cap)
@@ -232,14 +229,22 @@ def generate_macro_plan(
     pacing_mode: PacingMode = PacingMode.MILESTONE_SMOOTHED,
     max_weeks_at_peak: int = MAX_WEEKS_AT_PEAK_LONG_RUN,
     peak_long_run_cap: Optional[float] = None,
+    ramp_rate: float = 1.0,
 ) -> PlanVersion:
     """Generate the full macro arc from current actuals. See module
     docstring for the milestone rules this encodes.
 
-    `pacing_mode`, `max_weeks_at_peak` and `peak_long_run_cap` are the
-    knobs a conversational plan revision turns (see `revise_plan`), so
-    "smooth the ramp and cap me at two weeks of 22-milers" is a real
-    recomputation rather than a note stapled to the same numbers."""
+    `pacing_mode`, `max_weeks_at_peak`, `peak_long_run_cap` and
+    `ramp_rate` are the knobs a conversational plan revision turns (see
+    `revise_plan`), so "smooth the ramp and cap me at two weeks of
+    22-milers" is a real recomputation rather than a note stapled to the
+    same numbers.
+
+    `ramp_rate` scales how fast the long run climbs: <1 stretches the
+    climb ("ramp up slower", "let's cool down"), >1 compresses it. It can
+    only ever slow the climb below the guardrail increment, never past
+    it — asking to build faster gets you the guardrail maximum, not more.
+    """
     run_days = run_days_per_week or anchors.runs_per_week or config.athlete.available_run_days_per_week
 
     def volume_cap_for(lr: float) -> float:
@@ -283,14 +288,33 @@ def generate_macro_plan(
     # Back-off weeks don't advance the long run, so only ~cadence/(cadence+1)
     # of the calendar is usable for climbing; the schedule accounts for that.
     build_fraction = cadence / (cadence + 1)
-    weeks_to_peak = max(1, int((total_build_weeks - weeks_at_peak) * build_fraction))
+    calendar_weeks_to_peak = max(1, int((total_build_weeks - weeks_at_peak) * build_fraction))
+    # Smoothing spreads the climb over the calendar, but it must never
+    # stretch a short climb into a long plateau: an athlete already running
+    # 20 who needs 22 should not spend five months creeping through 20.x —
+    # that is months of avoidable high-mileage exposure wearing an
+    # "increasing" label. Cap the ramp at the weeks the climb genuinely
+    # needs (plus slack) and hand the surplus calendar to the maintain
+    # stage, which holds the same fitness at materially lower strain.
+    needed_weeks_to_peak = _weeks_needed_to_climb(baseline_lr, peak_lr_target, cadence)
+    # `ramp_rate` < 1 stretches the climb over more weeks ("ramp up
+    # slower"); > 1 compresses it, bounded below by the weeks the
+    # guardrail increment physically requires.
+    rate = max(0.1, min(float(ramp_rate or 1.0), 4.0))
+    needed_weeks_to_peak = max(1, round(needed_weeks_to_peak / rate))
+    weeks_to_peak = max(1, min(calendar_weeks_to_peak, needed_weeks_to_peak))
     build_week_index = 0
     smoothed = pacing_mode == PacingMode.MILESTONE_SMOOTHED
-    marathon_allowance = _PeakAllowance(ceiling=peak_lr_target, max_weeks=max_weeks_at_peak)
+    # None while still climbing; set to 0 the week the peak is first hit,
+    # after which every remaining build week comes from the maintain cycle.
+    maintain_index: Optional[int] = None
+    maintain_peak_vol = baseline_vol
 
-    def add(block: str, vol: float, lr: float, quality: int, is_backoff: bool, notes: str = "") -> None:
+    def add(block: str, vol: float, lr: float, quality: int, is_backoff: bool, notes: str = "",
+            stage: str = "") -> None:
         nonlocal week_num, cur_date
-        weeks.append(PlanWeek(week_num, cur_date, block, round(vol, 2), round(lr, 2), quality, is_backoff, notes))
+        weeks.append(PlanWeek(week_num, cur_date, block, round(vol, 2), round(lr, 2), quality,
+                              is_backoff, notes, stage))
         week_num += 1
         cur_date += timedelta(days=7)
 
@@ -303,16 +327,24 @@ def generate_macro_plan(
             lr = 0.0 if gap_easy_only else state.lr
             notes = ("Post-gap rebuild: easy running only, no long run yet." if gap_easy_only
                      else "Holding post-gap: no volume/long-run increase this week.")
-            add(block, state.vol, lr, 0, False, notes)
+            add(block, state.vol, lr, 0, False, notes,
+                stages.TrainingStage.REDUCE_MILEAGE.value if gap_easy_only
+                else stages.TrainingStage.INCREASE_MILEAGE.value)
             holds_remaining -= 1
             continue
 
-        hm_ready = (not hm_done) and state.lr >= HM_PREREQ_LONG_RUN_MI
+        # `build_week_index > 0` matters: an athlete who already runs 12+
+        # would otherwise taper for a half in week one of the plan, with no
+        # build week behind it and nothing for the validator's
+        # "12 mi before the taper" prerequisite to point at.
+        hm_ready = (not hm_done) and state.lr >= HM_PREREQ_LONG_RUN_MI and build_week_index > 0
         if hm_ready and hm_delay_remaining == 0 and weeks_remaining >= HM_TAPER_WEEKS + 3:
             add("hm_taper", state.vol * 0.65, state.peak_lr * 0.6, 0, False,
-                f"Half-marathon taper: 12 mi prerequisite met (long run at {state.lr:.1f} mi).")
+                f"Half-marathon taper: 12 mi prerequisite met (long run at {state.lr:.1f} mi).",
+                stages.TrainingStage.TAPER.value)
             add("half_marathon", state.vol * 0.6 + HM_DISTANCE_MI * 0.4, HM_DISTANCE_MI, 0, False,
-                "Half-marathon race week (flexible date — scheduled at earliest readiness).")
+                "Half-marathon race week (flexible date — scheduled at earliest readiness).",
+                stages.TrainingStage.TAPER.value)
             state.lr = max(state.lr, HM_DISTANCE_MI)
             state.peak_lr = max(state.peak_lr, HM_DISTANCE_MI)
             hm_done = True
@@ -320,10 +352,36 @@ def generate_macro_plan(
         if hm_ready and hm_delay_remaining > 0:
             hm_delay_remaining -= 1  # keep building; base is maintained, race waits
 
+        # Once the peak long run has been reached the plan switches from
+        # climbing to holding: the maintain stage keeps weekly volume high
+        # while oscillating the long run, so the peak is touched repeatedly
+        # without ever landing in back-to-back weeks (stages.py).
+        if maintain_index is not None:
+            lr, vol, is_backoff = stages.stage_targets(
+                stages.TrainingStage.MAINTAIN_MILEAGE,
+                peak_long_run_mi=peak_lr_target,
+                peak_volume_mi=maintain_peak_vol,
+                week_in_stage=maintain_index,
+                backoff_cadence=cadence,
+            )
+            vol = min(vol, volume_cap_for(peak_lr_target))
+            at_peak = stages.is_maintain_peak_week(maintain_index, cadence)
+            note = ("Maintain stage: peak long run — next week steps down, peaks are never "
+                    "run back-to-back." if at_peak else
+                    "Maintain stage: volume held high, long run reduced to cut strain.")
+            if is_backoff:
+                note = "Maintain-stage back-off week: closes the cycle before the next peak."
+            quality = 1 if hm_done and run_days >= MIN_DAYS_FOR_QUALITY and not is_backoff else 0
+            add(_block_label(hm_done), vol, lr, quality, is_backoff, note,
+                stages.TrainingStage.MAINTAIN_MILEAGE.value)
+            maintain_index += 1
+            continue
+
         if gr.should_insert_backoff_week(state.weeks_since_backoff, cadence):
             lr, vol = state.backoff_week()
             add(_block_label(hm_done), vol, lr, 0, True,
-                "Scheduled back-off week (3:1 cadence): no long-run increase, no quality.")
+                "Scheduled back-off week (3:1 cadence): no long-run increase, no quality.",
+                stages.TrainingStage.INCREASE_MILEAGE.value)
             continue
 
         target_lr = None
@@ -334,14 +392,21 @@ def generate_macro_plan(
             vol_cap=min(MARATHON_PREREQ_LONG_RUN_MI / TARGET_LONG_RUN_SHARE,
                         volume_cap_for(peak_lr_target)),
             scheduled_lr=target_lr,
-            allowance=marathon_allowance,
+            increment_scale=rate,
         )
         build_week_index += 1
         quality = 1 if hm_done and run_days >= MIN_DAYS_FOR_QUALITY else 0
         note = ""
         if smoothed and lr < HIGH_MILEAGE_LONG_RUN_MI <= peak_lr_target:
             note = "Smoothed ramp: holding below 15 mi until the calendar requires crossing it."
-        add(_block_label(hm_done), vol, lr, quality, False, note)
+        add(_block_label(hm_done), vol, lr, quality, False, note,
+            stages.TrainingStage.INCREASE_MILEAGE.value)
+
+        # Reaching the peak ends the increase stage. Everything after this
+        # is maintain, right up to the taper.
+        if lr >= peak_lr_target - stages.PEAK_TOLERANCE_MI:
+            maintain_index = 1          # the peak week just added is cycle position 0
+            maintain_peak_vol = max(state.peak_vol, vol)
 
     # ---- marathon taper + race -----------------------------------------------
     peak_lr, peak_vol = state.peak_lr, state.peak_vol
@@ -351,19 +416,21 @@ def generate_macro_plan(
             f"[!] Peak long run projected at {peak_lr:.1f} mi — the 20 mi marathon prerequisite is NOT "
             "met before this taper. See plan validation for details."
         )
+    _TAPER = stages.TrainingStage.TAPER.value
     add("marathon_taper", peak_vol * 0.60, min(12.0, peak_lr), 1, False,
-        ("Marathon taper (2 weeks): volume down, retain some intensity. " + taper_notes).strip())
+        ("Marathon taper (2 weeks): volume down, retain some intensity. " + taper_notes).strip(), _TAPER)
     add("marathon_taper", peak_vol * 0.45, min(8.0, peak_lr), 0, False,
-        "Marathon taper: final sharpening week.")
+        "Marathon taper: final sharpening week.", _TAPER)
     # Race week pinned to the fixed date.
     cur_date = race_week_start
     add("marathon", peak_vol * 0.35, MARATHON_DISTANCE_MI, 0, False,
-        f"Marathon race week — fixed date {marathon_date.isoformat()}.")
+        f"Marathon race week — fixed date {marathon_date.isoformat()}.", _TAPER)
 
     # ---- recovery -------------------------------------------------------------
     for pct in RECOVERY_WEEKS_VOLUME[: config.sequencing.post_marathon_recovery_weeks]:
         add("recovery", peak_vol * pct, min(6.0, peak_lr * 0.4), 0, False,
-            "Post-marathon recovery block: easy only, no long-run growth.")
+            "Post-marathon recovery block: easy only, no long-run growth.",
+            stages.TrainingStage.REDUCE_MILEAGE.value)
 
     # ---- ultra build -> >=30 mi/wk x3 -> taper -> 50K -------------------------
     # The 50K has no fixed date (it's scheduled once post-marathon recovery
@@ -380,46 +447,86 @@ def generate_macro_plan(
     # An athlete-set long-run cap applies to the whole plan, not just the
     # marathon block — "cap me at 16" means 16 everywhere.
     ultra_lr_cap = min(ULTRA_LONG_RUN_MAX_MI, peak_long_run_cap or ULTRA_LONG_RUN_MAX_MI)
-    ultra_allowance = _PeakAllowance(ceiling=ultra_lr_cap, max_weeks=max_weeks_at_peak)
     consecutive_30 = 0
     ultra_hold_remaining = max(0, ultra_delay_weeks)
+    ultra_maintain_index: Optional[int] = None
     while week_num < _MAX_PLAN_WEEKS:
-        if ustate.vol >= ULTRA_PREREQ_WEEKLY_MI:
-            consecutive_30 += 1
-            notes = f"Ultra prerequisite week {consecutive_30}/{ULTRA_PREREQ_CONSECUTIVE_WEEKS}: >=30 mi cumulative."
-            if consecutive_30 > ULTRA_PREREQ_CONSECUTIVE_WEEKS:
-                notes = "Holding >=30 mi/wk base (athlete-requested delay)."
-            # The >=30 mi/wk prerequisite is about *volume*, so these weeks
-            # hold volume — but the long run still obeys the peak allowance
-            # rather than repeating the block's biggest run every week.
-            lr = ultra_allowance.limit(min(ustate.lr, ultra_lr_cap))
-            add("ultra_build", ustate.vol, lr, 0, False,
-                notes + " Back-to-back long runs allowed in this block only.")
-            if consecutive_30 >= ULTRA_PREREQ_CONSECUTIVE_WEEKS:
-                if ultra_hold_remaining > 0:
-                    ultra_hold_remaining -= 1
-                else:
-                    break
+        volume_prereq_met = consecutive_30 >= ULTRA_PREREQ_CONSECUTIVE_WEEKS
+        long_run_prereq_met = ustate.peak_lr >= ultra_lr_cap - stages.PEAK_TOLERANCE_MI
+        # BOTH prerequisites gate the taper. Exiting on volume alone strands
+        # the long run wherever it happened to be — an undated 50K would
+        # taper off a 17 mi peak, which is not 50K preparation.
+        if volume_prereq_met and long_run_prereq_met and ultra_hold_remaining <= 0:
+            break
+
+        # The long run has topped out, so it switches to the maintain cycle
+        # even while volume is still climbing toward the >=30 mi/wk
+        # prerequisite. Leaving it in the increase stage would peg it at the
+        # ceiling week after week — a plateau at the cap, which is the exact
+        # pattern the maintain stage exists to break up.
+        if long_run_prereq_met:
+            at_prereq_volume = ustate.vol >= ULTRA_PREREQ_WEEKLY_MI
+            if at_prereq_volume:
+                consecutive_30 += 1
+                notes = (f"Ultra prerequisite week {consecutive_30}/{ULTRA_PREREQ_CONSECUTIVE_WEEKS}: "
+                         ">=30 mi cumulative.")
+                if consecutive_30 > ULTRA_PREREQ_CONSECUTIVE_WEEKS:
+                    notes = "Holding >=30 mi/wk base (athlete-requested delay)."
+            else:
+                consecutive_30 = 0
+                notes = "Peak long run reached; volume still building toward the >=30 mi/wk prerequisite."
+            if ultra_maintain_index is None:
+                # Position 0 of the cycle is the peak, and the week that
+                # just took us here was already at the block's peak —
+                # starting at 0 would put two peak weeks together.
+                ultra_maintain_index = 1
+            lr, _vol, is_backoff = stages.stage_targets(
+                stages.TrainingStage.MAINTAIN_MILEAGE,
+                peak_long_run_mi=min(ustate.peak_lr, ultra_lr_cap),
+                peak_volume_mi=ustate.vol,
+                week_in_stage=ultra_maintain_index,
+                backoff_cadence=cadence,
+            )
+            ultra_maintain_index += 1
+            # Volume keeps growing on non-back-off weeks so the prerequisite
+            # can still be met while the long run oscillates.
+            if not is_backoff and not at_prereq_volume:
+                ustate.vol = min(ustate.vol * gr.WEEKLY_VOLUME_GROWTH_FACTOR,
+                                 min(ULTRA_VOLUME_CAP_MI, volume_cap_for(ultra_lr_cap)))
+                ustate.peak_vol = max(ustate.peak_vol, ustate.vol)
+            add("ultra_build", ustate.vol, lr, 0, is_backoff,
+                notes + " Back-to-back long runs allowed in this block only.",
+                stages.TrainingStage.MAINTAIN_MILEAGE.value)
+            if consecutive_30 >= ULTRA_PREREQ_CONSECUTIVE_WEEKS and ultra_hold_remaining > 0:
+                ultra_hold_remaining -= 1
             continue
         if gr.should_insert_backoff_week(ustate.weeks_since_backoff, cadence):
             lr, vol = ustate.backoff_week()
             consecutive_30 = 0 if vol < ULTRA_PREREQ_WEEKLY_MI else consecutive_30
-            add("ultra_build", vol, lr, 0, True, "Back-off week inside ultra build.")
+            add("ultra_build", vol, lr, 0, True, "Back-off week inside ultra build.",
+                stages.TrainingStage.INCREASE_MILEAGE.value)
             continue
         lr, vol = ustate.build_week(lr_cap=ultra_lr_cap,
-                                     vol_cap=min(ULTRA_VOLUME_CAP_MI, volume_cap_for(ultra_lr_cap)),
-                                     allowance=ultra_allowance)
+                                     vol_cap=min(ULTRA_VOLUME_CAP_MI, volume_cap_for(ultra_lr_cap)))
+        if vol >= ULTRA_PREREQ_WEEKLY_MI:
+            consecutive_30 += 1
         add("ultra_build", vol, lr, 0, False,
             "" if ultra_pacing == PacingMode.MILESTONE_SMOOTHED
-            else "No 50K date set — ramping as fast as the guardrails allow.")
+            else "No 50K date set — ramping as fast as the guardrails allow.",
+            stages.TrainingStage.INCREASE_MILEAGE.value)
 
     upeak_vol = max(ustate.peak_vol, ustate.vol)
-    add("ultra_taper", upeak_vol * 0.60, 10.0, 0, False, "Ultra taper (2 weeks).")
-    add("ultra_taper", upeak_vol * 0.45, 8.0, 0, False, "Ultra taper: final week.")
+    upeak_lr = ustate.peak_lr
+    _TAPER = stages.TrainingStage.TAPER.value
+    add("ultra_taper", upeak_vol * 0.60, min(10.0, upeak_lr * 0.55), 0, False,
+        "Ultra taper (2 weeks).", _TAPER)
+    add("ultra_taper", upeak_vol * 0.45, min(8.0, upeak_lr * 0.36), 0, False,
+        "Ultra taper: final week.", _TAPER)
     ultra_race_date = cur_date
     add("ultra_50k", upeak_vol * 0.40, ULTRA_DISTANCE_MI, 0, False,
         f"50K race week — flexible date, projected {ultra_race_date.isoformat()} from the volume "
-        "prerequisite (>=30 mi/wk x3) plus taper. Confirmed after marathon recovery data.")
+        f"prerequisite (>=30 mi/wk x3) and a {upeak_lr:.0f} mi peak long run, plus taper. "
+        "Confirmed after marathon recovery data.", _TAPER)
 
     return PlanVersion(
         version=version,
@@ -540,9 +647,16 @@ class PlanConstraints:
     hm_delay_weeks: Optional[int] = None
     ultra_delay_weeks: Optional[int] = None
     run_days_per_week: Optional[int] = None
+    # Multiplier on how fast the long run climbs. <1 = gentler.
+    ramp_rate: float = 1.0
 
     def describe(self) -> list[str]:
         out = []
+        if abs(self.ramp_rate - 1.0) > 1e-6:
+            out.append(
+                f"long-run ramp {'slowed' if self.ramp_rate < 1 else 'accelerated'} to "
+                f"{self.ramp_rate:.2f}x the normal rate"
+            )
         if self.pacing_mode:
             out.append(
                 "smoothed ramp across the available weeks" if self.pacing_mode == PacingMode.MILESTONE_SMOOTHED
@@ -570,42 +684,110 @@ def revise_plan(
     rationale: str,
     base_hm_delay: int = 0,
     base_ultra_delay: int = 0,
-) -> PlanVersion:
+) -> tuple[PlanVersion, "object"]:
     """Recompute the whole macro plan under new constraints.
 
     This is the function behind conversational plan changes. It genuinely
     re-runs the generator rather than editing week rows, which is why the
-    resulting weekly volume and long-run numbers actually change."""
-    return generate_macro_plan(
+    resulting weekly volume and long-run numbers actually change — and it
+    goes through the same rule/repair loop as every other plan, so a
+    conversational request can't talk the plan into an invalid shape.
+
+    Returns (plan, rule_report)."""
+    # Whatever the athlete actually specified is locked: the repair loop
+    # may not undo their choice to satisfy a rule, only report the cost.
+    locked = {"ramp_rate"} if abs(constraints.ramp_rate - 1.0) > 1e-6 else set()
+    if constraints.pacing_mode is not None:
+        locked.add("pacing_mode")
+    if constraints.peak_long_run_cap is not None:
+        locked.add("peak_long_run_cap")
+    if constraints.run_days_per_week is not None:
+        locked.add("run_days_per_week")
+
+    return generate_checked_plan(
         config, anchors, as_of, version, "plan_revision", rationale,
+        locked=locked,
         hm_delay_weeks=constraints.hm_delay_weeks if constraints.hm_delay_weeks is not None else base_hm_delay,
         ultra_delay_weeks=constraints.ultra_delay_weeks if constraints.ultra_delay_weeks is not None else base_ultra_delay,
         run_days_per_week=constraints.run_days_per_week,
         pacing_mode=constraints.pacing_mode or PacingMode.MILESTONE_SMOOTHED,
         max_weeks_at_peak=constraints.max_weeks_at_peak or MAX_WEEKS_AT_PEAK_LONG_RUN,
         peak_long_run_cap=constraints.peak_long_run_cap,
+        ramp_rate=constraints.ramp_rate,
     )
+
+
+def generate_checked_plan(
+    config: Config,
+    anchors: Anchors,
+    as_of: date,
+    version: int,
+    trigger: str,
+    rationale: str,
+    locked: Optional[set[str]] = None,
+    **kwargs,
+) -> tuple[PlanVersion, "object"]:
+    """`generate_macro_plan` behind the milestone rules and their repair
+    loop (`rules.py`). This is the entry point every plan should come
+    through — a plan that breaks the milestone-shape rules is not one the
+    athlete should be handed, and the loop makes the inputs more
+    conservative and regenerates rather than patching week rows.
+
+    `locked` names inputs the athlete chose explicitly, which the repair
+    loop must not overwrite (see `rules.generate_valid_plan`).
+
+    Returns the plan and the rule report, so callers can surface any
+    violation the loop could not repair instead of hiding it.
+    """
+    from . import rules   # imported here: rules imports planner-adjacent modules
+
+    def _generate(cfg: Config, anch: Anchors, when: date, **gen_kwargs) -> PlanVersion:
+        # The repair loop speaks in plain dicts; translate its hints into
+        # generator arguments.
+        gen_kwargs.pop("force_maintain_oscillation", None)
+        mode = gen_kwargs.pop("pacing_mode", None)
+        if isinstance(mode, str):
+            mode = PacingMode(mode)
+        if mode is not None:
+            gen_kwargs["pacing_mode"] = mode
+        return generate_macro_plan(cfg, anch, when, version, trigger, rationale, **gen_kwargs)
+
+    plan, report = rules.generate_valid_plan(
+        _generate, config, anchors, as_of, base_kwargs=kwargs, locked=locked)
+    if not report.ok:
+        plan.rationale = (plan.rationale + " [!] Unresolved plan-rule violations: "
+                          + "; ".join(v.message for v in report.errors)).strip()
+    elif report.warnings:
+        plan.rationale = (plan.rationale + " Trade-offs accepted: "
+                          + "; ".join(v.message for v in report.warnings)).strip()
+    return plan, report
 
 
 PRE_MARATHON_BUILD_BLOCKS = ("base_building", "marathon_block")
 BUILD_BLOCKS = PRE_MARATHON_BUILD_BLOCKS + ("ultra_build",)
 
 
-def _peak_stats(weeks: list[PlanWeek]) -> tuple[float, int]:
-    """Peak TRAINING long run and how many weeks actually sit at it. Race
-    weeks are excluded by the caller — they carry the race distance, which
-    is not a training stimulus and would otherwise dominate the number.
+def _peak_stats(weeks: list[PlanWeek]) -> tuple[float, int, int]:
+    """Peak TRAINING long run, how many weeks touch it, and the longest run
+    of *consecutive* peak weeks. Race weeks are excluded by the caller —
+    they carry the race distance, which is not a training stimulus.
 
-    The tolerance here is deliberately tight: this answers "how many weeks
-    am I running 22?", which is a question about a plateau. A week 1 mi
-    short of the peak is part of the climb, not a repeat of it. (The wider
-    PEAK_PROXIMITY_MI band is what `_PeakAllowance` budgets against while
-    generating — enforcement is the conservative side, reporting is the
-    literal one.)"""
+    Both counts matter, and they answer different questions. Touching the
+    peak repeatedly is the whole point of the maintain stage, so a total of
+    four is healthy. Touching it twice in a row is the injury pattern, so
+    the consecutive figure is the one with a hard limit on it.
+
+    The tolerance is deliberately tight: a week 1 mi short of the peak is
+    part of the oscillation, not a repeat of the peak."""
     peak = max((w.long_run_mi for w in weeks), default=0.0)
-    at_peak = sum(1 for w in weeks
-                  if w.long_run_mi >= peak - _DIFF_COMPARE_TOLERANCE_MI and not w.is_backoff)
-    return peak, at_peak
+    at_peak = 0
+    longest_run = run = 0
+    for w in weeks:
+        is_peak = w.long_run_mi >= peak - _DIFF_COMPARE_TOLERANCE_MI and not w.is_backoff
+        at_peak += 1 if is_peak else 0
+        run = run + 1 if is_peak else 0
+        longest_run = max(longest_run, run)
+    return peak, at_peak, longest_run
 
 
 def summarize_plan(plan: PlanVersion) -> dict:
@@ -615,20 +797,26 @@ def summarize_plan(plan: PlanVersion) -> dict:
     `peak_long_run_mi` / `weeks_at_peak_long_run` describe the build up to
     the marathon taper — that's the window the athlete means by "how long
     am I at peak before the taper". The 50K block is reported separately
-    because it peaks later, after a full recovery block."""
+    because it peaks later, after a full recovery block.
+
+    `max_consecutive_peak_weeks` is the safety number: it must never exceed
+    1, because a max-mileage week has to be followed by a back-off or the
+    taper. Repeated peaks are fine; adjacent ones are not."""
     build = [w for w in plan.weeks if w.block in BUILD_BLOCKS]
     pre_marathon = [w for w in plan.weeks if w.block in PRE_MARATHON_BUILD_BLOCKS]
     ultra = [w for w in plan.weeks if w.block == "ultra_build"]
-    peak_lr, at_peak = _peak_stats(pre_marathon)
-    ultra_peak, ultra_at_peak = _peak_stats(ultra)
+    peak_lr, at_peak, consecutive_peak = _peak_stats(pre_marathon)
+    ultra_peak, ultra_at_peak, ultra_consecutive = _peak_stats(ultra)
     return {
         "total_weeks": len(plan.weeks),
         "peak_long_run_mi": round(peak_lr, 1),
         "weeks_at_peak_long_run": at_peak,
+        "max_consecutive_peak_weeks": max(consecutive_peak, ultra_consecutive),
         "ultra_peak_long_run_mi": round(ultra_peak, 1),
         "weeks_at_ultra_peak_long_run": ultra_at_peak,
         "weeks_over_15mi_long_run": sum(1 for w in build if w.long_run_mi > HIGH_MILEAGE_LONG_RUN_MI),
         "peak_weekly_volume_mi": round(max((w.target_volume_mi for w in plan.weeks), default=0.0), 1),
+        "stages": stages.stage_summary(plan.weeks),
         "milestones": [
             {"block": w.block, "week": w.week_number, "start_date": w.start_date.isoformat()}
             for w in plan.weeks if w.block in ("half_marathon", "marathon", "ultra_50k")

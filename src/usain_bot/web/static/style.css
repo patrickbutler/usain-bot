@@ -252,6 +252,18 @@ th { color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transf
 tr.backoff { background: var(--surface-2); }
 .week-tag { display: inline-block; padding: 2px 8px; border-radius: 6px; background: var(--chip-bg); font-size: 0.72rem; }
 
+/* Training stage per week (stages.py). Colour-coded so the shape of the
+   plan — climb, hold, taper — is readable at a glance down the column. */
+.stage-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.7rem;
+  font-weight: 600; text-transform: capitalize; white-space: nowrap; background: var(--chip-bg);
+}
+.stage-increase_mileage { color: var(--green); background: color-mix(in srgb, var(--green) 15%, var(--chip-bg)); }
+.stage-maintain_mileage { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 20%, var(--chip-bg)); }
+.stage-taper { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, var(--chip-bg)); }
+.stage-reduce_mileage { color: var(--text-muted); }
+.stage-legend { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+
 .hint-text { font-size: 0.78rem; color: var(--text-muted); }
 
 /* --- feelings + validation --- */

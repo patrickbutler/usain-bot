@@ -167,6 +167,7 @@ def tool_validate_plan(service: CoachService, input: dict) -> dict:
 
 
 def tool_propose_plan_revision(service: CoachService, input: dict) -> dict:
+    from .. import pacing_intent
     from ..planner import PacingMode, PlanConstraints
 
     mode = None
@@ -176,7 +177,7 @@ def tool_propose_plan_revision(service: CoachService, input: dict) -> dict:
         except ValueError:
             return {"error": f"pacing_mode must be one of {[m.value for m in PacingMode]}"}
 
-    constraints = PlanConstraints(
+    explicit = PlanConstraints(
         pacing_mode=mode,
         max_weeks_at_peak=input.get("max_weeks_at_peak"),
         peak_long_run_cap=input.get("peak_long_run_cap"),
@@ -184,9 +185,50 @@ def tool_propose_plan_revision(service: CoachService, input: dict) -> dict:
         ultra_delay_weeks=input.get("ultra_delay_weeks"),
         run_days_per_week=input.get("run_days_per_week"),
     )
+
+    # Governance: the model picks WHICH pacing change is being asked for;
+    # the magnitude comes from pacing_intent, never from the model. An
+    # explicit number the athlete gave still wins over the phrase default.
+    intent_name = input.get("pacing_intent")
+    intent_note = None
+    constraints = explicit
+    if intent_name:
+        base = pacing_intent.constraints_for_intent(str(intent_name))
+        if base is None:
+            return {"error": f"pacing_intent must be one of {list(pacing_intent.VALID_INTENTS)}"}
+        constraints = pacing_intent.merge_constraints(base, explicit)
+        intent_note = str(intent_name)
+
     if not constraints.describe():
-        return {"error": "No constraints supplied — specify at least one thing to change."}
-    return service.propose_plan_revision(constraints, str(input.get("rationale", "Athlete-requested revision")))
+        return {"error": "No constraints supplied — specify at least one thing to change, "
+                         "or pass pacing_intent for a request like 'ramp up slower'."}
+    result = service.propose_plan_revision(
+        constraints, str(input.get("rationale", "Athlete-requested revision")))
+    if intent_note:
+        result["pacing_intent"] = intent_note
+    return result
+
+
+def tool_get_plan_range(service: CoachService, input: dict) -> dict:
+    """Full week-by-week plan for a requested slice — never abbreviated."""
+    from datetime import date as _date
+
+    def parse(key: str):
+        raw = input.get(key)
+        return _date.fromisoformat(str(raw)) if raw else None
+
+    try:
+        return service.get_plan_range_payload(
+            weeks_ahead=int(input["weeks_ahead"]) if input.get("weeks_ahead") else None,
+            from_date=parse("from_date"), to_date=parse("to_date"),
+            from_milestone=input.get("from_milestone"), to_milestone=input.get("to_milestone"),
+        )
+    except ValueError as exc:
+        return {"error": f"Could not read the requested range: {exc}"}
+
+
+def tool_get_milestones(service: CoachService, input: dict) -> dict:
+    return service.get_milestones_payload()
 
 
 def tool_publish_draft_plan(service: CoachService, input: dict) -> dict:
@@ -234,6 +276,40 @@ TOOL_SPECS: list[ToolSpec] = [
             "Get the full current training plan: every week's block, target volume, long run, "
             "quality sessions, and back-off flag, plus the projected half-marathon-capability week. "
             "Call this for any question about the overall plan, upcoming weeks, or milestones."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_plan_range",
+        description=(
+            "Get the COMPLETE week-by-week plan for a specific slice — every week in the range, "
+            "never a summary. Use this for any 'show me the plan' question. Pick the range from what "
+            "the athlete asked for: weeks_ahead for 'the next 4 weeks'; from_milestone/to_milestone "
+            "for 'between my half marathon and my marathon' (values: half_marathon, marathon, "
+            "ultra_50k); from_date/to_date for explicit dates. Call with no arguments ONLY when the "
+            "athlete has genuinely asked for the whole plan. Each week comes back with its training "
+            "stage (increase_mileage / maintain_mileage / taper / reduce_mileage) — report the stage, "
+            "it explains why the numbers move the way they do."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "weeks_ahead": {"type": "integer", "description": "Number of upcoming weeks to show"},
+                "from_date": {"type": "string", "description": "ISO date, start of the window"},
+                "to_date": {"type": "string", "description": "ISO date, end of the window"},
+                "from_milestone": {"type": "string", "enum": ["half_marathon", "marathon", "ultra_50k"]},
+                "to_milestone": {"type": "string", "enum": ["half_marathon", "marathon", "ultra_50k"]},
+            },
+        },
+    ),
+    ToolSpec(
+        name="get_milestones",
+        description=(
+            "List the athlete's upcoming milestones and — critically — whether each has a SET DATE. "
+            "That distinction drives the whole plan shape: a dated milestone gets a smoothed ramp then "
+            "a maintain stage until its taper; an undated one gets a conservative build to its peak "
+            "long run and then tapers straight in. Call this before discussing timing, readiness, or "
+            "'when will I be ready for X'."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
@@ -384,6 +460,9 @@ TOOL_SPECS: list[ToolSpec] = [
             "'I'm doing too many 22 mile weeks', 'cap my long runs at 20', 'build faster', 'I can only "
             "run 3 days a week now'. It genuinely recalculates weekly mileage and long-run distances; "
             "never claim a plan changed without calling this. "
+            "For vague pacing language — 'ramp up slower', 'let's cool down', 'ease off', 'hold steady' "
+            "— set pacing_intent and do NOT invent your own numbers: the system owns how big the change "
+            "is. Combine pacing_intent with an explicit cap only when the athlete gave one. "
             "The result is NOT saved: show the athlete what changed (use the summary and diff) and ask "
             "explicitly whether to make it official, then call publish_draft_plan only if they agree."
         ),
@@ -391,6 +470,16 @@ TOOL_SPECS: list[ToolSpec] = [
             "type": "object",
             "properties": {
                 "rationale": {"type": "string", "description": "Why the athlete wants this, in their words — stored with the version"},
+                "pacing_intent": {
+                    "type": "string",
+                    "enum": ["slow_down", "cool_down", "speed_up", "smooth", "hold"],
+                    "description": (
+                        "The pacing change the athlete asked for in words. slow_down = 'ramp up slower' / "
+                        "'ease off'; cool_down = 'let's cool down' / 'back right off' (also caps the long "
+                        "run below 15 mi); speed_up = 'build faster'; smooth = 'even it out'; hold = "
+                        "'stop increasing, hold where I am'. The magnitude is decided by the system."
+                    ),
+                },
                 "pacing_mode": {
                     "type": "string", "enum": ["milestone_smoothed", "ramp_asap"],
                     "description": "milestone_smoothed spreads the ramp across available weeks (use when a dated goal exists or the athlete wants it gentler); ramp_asap builds as fast as safely allowed (use when no date is set)",
@@ -430,6 +519,8 @@ TOOL_SPECS: list[ToolSpec] = [
 _DISPATCH: dict[str, Callable[[CoachService, dict], dict]] = {
     "get_today_recommendation": tool_get_today_recommendation,
     "get_plan_overview": tool_get_plan_overview,
+    "get_plan_range": tool_get_plan_range,
+    "get_milestones": tool_get_milestones,
     "get_plan_history": tool_get_plan_history,
     "get_run_history": tool_get_run_history,
     "ease_upcoming_week": tool_ease_upcoming_week,

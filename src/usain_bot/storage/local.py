@@ -21,10 +21,11 @@ import json
 import re
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from .. import stages
 from ..models import (
     Activity,
     ActivityType,
@@ -326,9 +327,13 @@ class LocalBackend(StorageBackend):
                 quality_sessions=w["quality_sessions"],
                 is_backoff=w["is_backoff"],
                 notes=w.get("notes", ""),
+                # Absent on versions saved before stages existed; inferred
+                # from the plan's shape just below.
+                stage=w.get("stage", ""),
             )
             for w in weeks_raw
         ]
+        stages.annotate_stages(weeks)
         return PlanVersion(
             version=row["version"],
             created_at=datetime.fromisoformat(row["created_at"]),
@@ -499,17 +504,23 @@ class LocalBackend(StorageBackend):
             self._conn.commit()
 
     def get_recent_run_feedback(self, days: int = 14, limit: int = 20) -> list[RunFeedback]:
+        """Feedback recorded within `days`, newest first.
+
+        The window is applied in SQL *before* the limit. Doing it the other
+        way round (fetch `limit` rows, then filter) silently drops in-window
+        entries as soon as the table holds more than `limit` rows, which
+        makes already-rated runs look unrated again.
+        """
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM run_feedback ORDER BY timestamp DESC LIMIT ?", (limit,)
+                "SELECT * FROM run_feedback WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?",
+                (cutoff, limit),
             ).fetchall()
-        cutoff = datetime.utcnow().timestamp() - days * 86400
-        out = []
-        for r in rows:
-            ts = datetime.fromisoformat(r["timestamp"])
-            if ts.timestamp() >= cutoff:
-                out.append(RunFeedback(
-                    timestamp=ts, score=r["score"], comment=r["comment"],
-                    activity_date=date.fromisoformat(r["activity_date"]) if r["activity_date"] else None,
-                ))
-        return out
+        return [
+            RunFeedback(
+                timestamp=datetime.fromisoformat(r["timestamp"]), score=r["score"], comment=r["comment"],
+                activity_date=date.fromisoformat(r["activity_date"]) if r["activity_date"] else None,
+            )
+            for r in rows
+        ]

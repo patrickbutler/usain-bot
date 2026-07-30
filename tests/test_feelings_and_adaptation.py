@@ -59,6 +59,66 @@ class TestRunFeedbackStorage:
         storage.save_run_feedback(RunFeedback(datetime.utcnow(), 5, "newer"))
         assert storage.get_recent_run_feedback()[0].comment == "newer"
 
+    def test_window_is_applied_before_the_limit(self, storage):
+        """Filtering after the LIMIT silently drops in-window entries once
+        the table outgrows the limit, which makes rated runs look unrated."""
+        for i in range(30):
+            storage.save_run_feedback(
+                RunFeedback(datetime.utcnow() - timedelta(minutes=i), 3, f"e{i}", date(2026, 7, 1)))
+        storage.save_run_feedback(RunFeedback(datetime.utcnow() - timedelta(days=90), 1, "ancient"))
+        got = storage.get_recent_run_feedback(days=14, limit=100)
+        assert len(got) == 30
+        assert "ancient" not in [f.comment for f in got]
+
+
+class TestUndatedScoresBindToARun:
+    """A score logged without a date — "that one was rough", the normal
+    chat phrasing — must attach to an actual run. Stored dateless it can
+    never mark a run rated, so the coach re-asks about runs the athlete
+    already answered for while the feelings list shows the score against
+    its recording date and looks correct."""
+
+    def test_undated_score_attaches_to_the_latest_unrated_run(self, service):
+        service.sync(as_of=TODAY)
+        before = [r["date"] for r in service.get_unrated_recent_runs(days=10)]
+        assert before, "fixture must supply unrated runs for this test to mean anything"
+
+        fb = service.record_run_feeling(2, "rough one")
+        assert fb.activity_date is not None
+        assert fb.activity_date.isoformat() == before[0]
+
+    def test_the_rated_run_stops_being_asked_about(self, service):
+        service.sync(as_of=TODAY)
+        before = service.get_unrated_recent_runs(days=10)
+        service.record_run_feeling(2, "rough one")
+        after = [r["date"] for r in service.get_unrated_recent_runs(days=10)]
+        assert before[0]["date"] not in after
+        assert len(after) < len(before)
+
+    def test_consecutive_undated_scores_walk_back_through_runs(self, service):
+        service.sync(as_of=TODAY)
+        first = service.record_run_feeling(2, "rough")
+        second = service.record_run_feeling(4, "much better")
+        assert first.activity_date != second.activity_date
+
+    def test_score_shows_against_the_run_not_the_recording_date(self, service):
+        service.sync(as_of=TODAY)
+        service.record_run_feeling(5, "flying")
+        entries = service.get_recent_feelings_payload(days=21)["entries"]
+        assert all(e["activity_date"] is not None for e in entries)
+        linked = {r["date"]: r["score"] for r in service.get_run_feelings_payload(days=90)["runs"] if r["score"]}
+        assert 5 in linked.values()
+
+    def test_explicit_date_still_wins(self, service):
+        service.sync(as_of=TODAY)
+        fb = service.record_run_feeling(3, "meh", date(2026, 7, 18))
+        assert fb.activity_date == date(2026, 7, 18)
+
+    def test_no_unrated_runs_leaves_the_entry_unlinked(self, service):
+        """Nothing to attach to is a real state — it must not invent a date."""
+        fb = service.record_run_feeling(4, "great", None)
+        assert fb.activity_date is None
+
 
 class TestFeelingsAffectRecommendation:
     def test_rough_feelings_lower_the_ceiling(self, config, storage, service):

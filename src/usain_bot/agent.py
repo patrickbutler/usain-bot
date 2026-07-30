@@ -37,6 +37,7 @@ from .planner import (
     apply_override,
     diff_plan_versions,
     diff_plan_weeks,
+    generate_checked_plan,
     generate_macro_plan,
 )
 from .storage.base import StorageBackend
@@ -663,12 +664,23 @@ def run_invocation(
         max_weeks_at_peak=approved.max_weeks_at_peak or MAX_WEEKS_AT_PEAK_LONG_RUN,
         peak_long_run_cap=approved.peak_long_run_cap,
     )
+    # A persisted preference is still the athlete's decision, so the rule
+    # repair loop must not quietly undo it to satisfy a rule — otherwise an
+    # approved "cap me at 16" evaporates on the next reprojection, which is
+    # the same silent-revert failure the draft/publish flow exists to stop.
+    locked_kwargs = {"pacing_mode"} if approved.pacing_mode else set()
+    if approved.peak_long_run_cap is not None:
+        locked_kwargs.add("peak_long_run_cap")
+    if approved.max_weeks_at_peak is not None:
+        locked_kwargs.add("max_weeks_at_peak")
 
     if action.regenerate_plan:
         trigger = "gap_regeneration"
         rationale = f"Gap of {gap.gap_days} days exceeds 6 weeks: {action.description}"
         rationale += _cited_reference_note(storage, "return to running after long break detraining")
-        plan = generate_macro_plan(config, anchors, as_of, next_version, trigger, rationale, **plan_kwargs)
+        plan, _rule_report = generate_checked_plan(
+            config, anchors, as_of, next_version, trigger, rationale,
+            locked=locked_kwargs, **plan_kwargs)
     else:
         trigger = "scheduled_reprojection" if gap.severity == GapSeverity.SHORT else "gap_detected"
         rationale = (
@@ -683,8 +695,9 @@ def run_invocation(
             )
         if gap.severity != GapSeverity.SHORT:
             rationale += _cited_reference_note(storage, "return to running after a break gap protocol")
-        plan = generate_macro_plan(
+        plan, _rule_report = generate_checked_plan(
             config, anchors, as_of, next_version, trigger, rationale,
+            locked=locked_kwargs,
             gap_hold_weeks=action.backtrack_weeks,
             gap_easy_only=action.easy_only,
             **plan_kwargs,
