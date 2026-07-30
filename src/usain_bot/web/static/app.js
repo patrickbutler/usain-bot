@@ -343,7 +343,7 @@
           mean ${data.mean_score}/5 across ${data.count} check-in(s)</p>
         ${data.entries.slice(0, 6).map((e) => `
           <div class="day-row">
-            <span class="day-date">${(e.activity_date || e.timestamp.slice(0, 10)).slice(5)}</span>
+            <span class="day-date">${e.activity_date ? e.activity_date.slice(5) : "unlinked"}</span>
             <span class="day-type">${SCORE_LABELS[e.score] || e.score} (${e.score}/5)</span>
             <span class="day-dist">${escapeHtml(e.comment || "")}</span>
           </div>`).join("")}`;
@@ -372,6 +372,24 @@
       ${issues || `<p class="hint-text">All milestone and build-rate checks passed.</p>`}`;
   }
 
+  const STAGE_BLURB = {
+    increase_mileage: "climbing toward the peak long run",
+    maintain_mileage: "peak reached — volume stays high while the long run oscillates, so peak weeks are never back-to-back",
+    taper: "strategic reduction into a milestone",
+    reduce_mileage: "below 15 mi, no milestone being chased",
+  };
+
+  // Phases come from the server (stages.stage_summary) rather than being
+  // regrouped here, so the legend, the chat and the API can't disagree
+  // about the shape of the plan.
+  function renderStageLegend(phases) {
+    if (!phases || phases.length < 2) return "";
+    return `<div class="stage-legend">${phases.map((p) => `
+      <span class="stage-tag stage-${p.stage || "unknown"}" title="${escapeHtml(STAGE_BLURB[p.stage] || "")}">
+        ${escapeHtml(p.label || "")} · ${p.weeks}w
+      </span>`).join("")}</div>`;
+  }
+
   function renderPlan(plan) {
     const body = $("#plan-body");
     if (plan.error) {
@@ -384,14 +402,16 @@
         <td>${w.week_number}</td>
         <td>${w.start_date}</td>
         <td><span class="week-tag">${w.block.replace(/_/g, " ")}</span></td>
+        <td><span class="stage-tag stage-${w.stage || "unknown"}">${(w.stage || "").replace(/_/g, " ")}</span></td>
         <td>${w.target_volume_mi.toFixed(1)} mi</td>
         <td>${w.long_run_mi.toFixed(1)} mi</td>
         <td>${w.quality_sessions}</td>
       </tr>
     `).join("");
     body.innerHTML = `
+      ${renderStageLegend(plan.stages)}
       <table>
-        <thead><tr><th>Wk</th><th>Start</th><th>Block</th><th>Volume</th><th>Long run</th><th>Quality</th></tr></thead>
+        <thead><tr><th>Wk</th><th>Start</th><th>Block</th><th>Stage</th><th>Volume</th><th>Long run</th><th>Quality</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       ${plan.half_marathon_capability_week ? `<p class="rec-line" style="margin-top:10px">Half-marathon capability projected: week ${plan.half_marathon_capability_week.week_number} (${plan.half_marathon_capability_week.start_date})</p>` : ""}

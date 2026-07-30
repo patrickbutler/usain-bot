@@ -20,6 +20,10 @@ src/usain_bot/
   models.py                 shared dataclasses/enums, no I/O
   config.py                 loads config.yaml + .env
   ingest.py                 data-quality gate: validation, repair, dedupe (auto, every write)
+  milestones.py             what you're training for + whether it has a set date
+  stages.py                 training stages; the maintain cycle that keeps peaks apart
+  rules.py                  milestone-shape rules + the repair loop that enforces them
+  pacing_intent.py          "ramp up slower" -> plan constraints, deterministically
   sessions.py               split-run merging (<=3h gap = one run)
   classification.py         merged sessions -> classified runs -> load anchors
   guardrails.py             every §5 formula as a pure, unit-tested function
@@ -157,8 +161,8 @@ usain-bot serve
 
 Opens a local web server (default `http://127.0.0.1:8420`) with three tabs, built entirely on the same `agent`/`planner`/`storage` functions as the CLI — it's a view onto the same system, not a second implementation:
 
-- **Chat** — your coach, who speaks with a Jamaican accent and plenty of slang (style only — every number, date, and safety warning still comes from the tools, stated plainly). Ask about today's run, the plan, or your history; apply overrides ("make next week easier," "push my half marathon back three weeks"); mention symptoms ("my hip's been sore") or how a run felt ("legs were dead out there") and it records both, which feeds the recommendation math directly. Replies render as Markdown, so tables, lists and week-by-week breakdowns are readable rather than a wall of text. The composer is a textarea that grows with your message: **Enter inserts a newline, ⌘/Ctrl+Enter (or the Send button) sends** — so a long, multi-paragraph description of a niggle doesn't fire off half-written.
-- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week, one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override, an approved plan revision), expandable to see exactly which weeks changed and how. Any plan change made in Chat re-renders this tab immediately.
+- **Chat** — your coach, who speaks with a Jamaican accent and plenty of slang (style only — every number, date, and safety warning still comes from the tools, stated plainly). Ask about today's run, the plan, or your history; apply overrides ("make next week easier," "push my half marathon back three weeks"); mention symptoms ("my hip's been sore") or how a run felt ("legs were dead out there") and it records both, which feeds the recommendation math directly. Replies render as Markdown, so tables, lists and week-by-week breakdowns are readable rather than a wall of text. **Asking to see the plan gets you every week of it** — `get_plan_range` takes "the next 4 weeks", "between my half marathon and my marathon", or a date window, and returns the complete range with no truncation; if the scope is ambiguous the coach asks which stretch you want instead of quietly trimming it. The composer is a textarea that grows with your message: **Enter inserts a newline, ⌘/Ctrl+Enter (or the Send button) sends** — so a long, multi-paragraph description of a niggle doesn't fire off half-written.
+- **Upcoming** — today's recommendation, the binding constraint, a rolling 7-day view, the full plan week by week (each with its **training stage**, so you can see the climb / hold / taper shape down the column), one-click hip/back/fatigue flags, a refresh button, and a **Plan history** section: every plan version ever saved, newest first, with what triggered it and why (`usain-bot run` reprojection, a gap protocol, a conversational override, an approved plan revision), expandable to see exactly which weeks changed and how. Any plan change made in Chat re-renders this tab immediately.
 - **History** — a weekly volume chart, a **How your runs felt** section pairing every run with its 1–5 subjective score (score unrated runs inline; already-scored runs show the score and are never asked about again), and a table of past runs (classified long/easy/quality/recovery/cross-training) pulled straight from Garmin, with a manual sync button.
 
 ### Jamaican mode (hidden settings page)
@@ -292,6 +296,80 @@ ceiling of 0.0 mi, so on that day the recommendation is rest and the
 binding constraint says so. The 7-day projection draws the rest day in
 the right place too, even when it lands on a normal run day.
 
+### Training stages
+
+Every plan week belongs to exactly one stage, and the stage is not a
+label applied afterwards — it *decides* the week's long run and volume
+(`stages.stage_targets`). A week tagged "maintain" that quietly kept
+climbing would be a lie, so the tag and the numbers come from one place.
+
+| Stage | When | What it does |
+|---|---|---|
+| `increase_mileage` | climbing toward a milestone's peak long run | rises by at most the min(1 mi, 10%) guardrail increment |
+| `maintain_mileage` | peak reached, milestone still weeks away | weekly volume stays high while the long run **oscillates** |
+| `taper` | running into a milestone | strategic reduction, sharpest in the final week |
+| `reduce_mileage` | no milestone being chased | below the 15 mi line — recovery blocks, off-season |
+
+**Why maintain oscillates instead of plateauing.** Once you can run 22,
+running 22 every week doesn't make you better at it — it just accumulates
+the injury cost. So the maintain stage spends one peak week, backs off,
+and rebuilds toward it, touching the peak repeatedly without ever
+stacking it:
+
+```
+peak 22.0  ->  16.1  ->  18.7  ->  back-off 15.4  ->  peak 22.0  -> ...
+```
+
+The cycle length follows your configured back-off cadence (3 build : 1
+back-off by default), so the back-off week the rest of the system already
+expects *is* the last week of each maintain cycle.
+
+**The hard rule: a max-mileage week is never followed by another one.**
+It's enforced three ways — structurally (reaching the peak ends the
+increase stage and hands over to the maintain cycle), by the validator
+(`back_to_back_peak`, an error, checked per training block so the 50K
+block is judged against its own peak), and by the repair loop below.
+
+### Milestones: dated vs undated
+
+`milestones.py` is the single source of truth for what you're training
+for and whether it has a date. That one fact changes the entire shape of
+the plan:
+
+| | Dated milestone | Undated milestone |
+|---|---|---|
+| Ramp | smoothed across the weeks actually available | conservative, at the guardrail rate |
+| After the peak | **maintain** until the taper | taper starts promptly |
+| The date | an input | an *output* of readiness |
+
+Read it via `GET /api/milestones` or just ask the coach — it calls
+`get_milestones` before discussing timing. Each milestone carries its own
+preparation target (a 22 mi long run before a marathon, 24 before a 50K,
+12 before a half) and taper length.
+
+### Plan rules and the repair loop
+
+`validation.py` referees the *training* rules. `rules.py` referees the
+**shape the milestones demand** — and unlike the validator it doesn't just
+report, it repairs. `generate_valid_plan` regenerates with corrected
+inputs until the rules pass, rather than patching week rows (a patched
+week is inconsistent with the weeks around it, which is how plans drift
+out of shape in the first place). Every plan goes through
+`planner.generate_checked_plan`, so this is not an optional pass.
+
+**It will not overrule you.** Inputs you chose explicitly — a long-run
+cap, a slower ramp, your running days — are *locked*. If satisfying a
+rule would require undoing one of them, the loop honours your choice and
+reports the cost as a warning instead:
+
+> marathon needs a 22 mi long run before its taper; the plan only reaches
+> 20.5 mi (1.5 mi short). *(accepted: this follows from what you asked for)*
+
+That distinction is load-bearing in both directions: the same shortfall
+with nobody having asked for it is an **error** the loop must actually
+fix. And a preference you published survives reprojection — the repair
+loop is not allowed to quietly clear an approved cap.
+
 ### Pacing: how fast the long run climbs
 
 Two modes, because "when is the goal?" changes the right answer:
@@ -316,6 +394,25 @@ Both are athlete-adjustable through a plan revision ("cap me at 18 miles",
 "only two weeks at the peak"), as is running frequency, which caps how
 much volume a week can absorb (one long run plus easy days at 60% of it)
 and removes the quality session below 4 days/week.
+
+**Pacing in plain language.** "Ramp up slower", "let's cool down", "ease
+off", "build me up faster", "hold where I am" are all plan changes, not
+just reassurance — and `pacing_intent.py` maps them onto constraints
+deterministically, in unit-tested Python. The model picks *which* intent
+was expressed; it never picks how big the change is. `ramp_rate` scales
+the weekly climb and is clamped at 1.0, so "build me faster" gets the
+guardrail maximum and not a mile more.
+
+| Phrase | Intent | Effect |
+|---|---|---|
+| "ramp up slower", "ease off" | `slow_down` | climb at 0.6× the normal rate |
+| "let's cool down", "back right off" | `cool_down` | 0.4× **and** long run capped below 15 mi |
+| "build me up faster" | `speed_up` | as fast as the guardrails allow |
+| "smooth it out" | `smooth` | 0.75×, spread across the weeks available |
+| "hold where I am" | `hold` | stop climbing, maintain |
+
+An unrecognised phrase returns nothing rather than a guess — the coach
+asks what you meant instead of inventing a number.
 
 ### Changing the plan in conversation: draft, review, publish
 

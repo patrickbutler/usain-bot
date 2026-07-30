@@ -18,11 +18,14 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import agent
+from . import milestones as ms
+from . import pacing_intent
 from . import planner
+from . import stages
 from .classification import compute_anchors, prepare_classified
 from .config import Config
 from .garmin_adapter.base import GarminAdapter
-from .models import Anchors, ClassifiedActivity, HealthFlag, PlanVersion, RunFeedback
+from .models import Anchors, ClassifiedActivity, HealthFlag, PlanVersion, PlanWeek, RunFeedback
 from .projection import project_next_7_days
 from .storage.base import StorageBackend
 from .validation import validate_plan
@@ -109,12 +112,29 @@ class CoachService:
 
     def record_run_feeling(self, score: int, comment: Optional[str] = None,
                             activity_date: Optional[date] = None) -> RunFeedback:
+        """Log how a run felt, always attached to a specific run.
+
+        When no date is named — "that one was rough", which is how it
+        usually arrives in chat — the score is bound to the most recent
+        unrated run rather than stored dateless. A dateless entry can never
+        mark a run as rated, so the coach would keep asking about a run the
+        athlete has already answered for, while the feelings list showed
+        the score against its *recording* date and looked correct. Resolving
+        it here means one write path, one notion of "rated".
+        """
         score = max(1, min(5, int(score)))
-        fb = RunFeedback(timestamp=datetime.utcnow(), score=score, comment=comment, activity_date=activity_date)
+        resolved = activity_date or self._most_recent_unrated_run_date()
+        fb = RunFeedback(timestamp=datetime.utcnow(), score=score, comment=comment, activity_date=resolved)
         self.storage.save_run_feedback(fb)
         with self._lock:
             self._cached = None  # today's ceiling may now be lower
         return fb
+
+    def _most_recent_unrated_run_date(self) -> Optional[date]:
+        """The run an undated comment is most likely about. None only when
+        there is genuinely no unrated run to attach it to."""
+        unrated = self.get_unrated_recent_runs(days=14)
+        return date.fromisoformat(unrated[0]["date"]) if unrated else None
 
     def get_recent_feelings_payload(self, days: int = 14) -> dict:
         feedback = self.storage.get_recent_run_feedback(days=days)
@@ -208,7 +228,7 @@ class CoachService:
         base_hm = agent._read_int_preference(self.storage, agent.PREF_HM_DELAY_WEEKS)
         base_ultra = agent._read_int_preference(self.storage, agent.PREF_ULTRA_DELAY_WEEKS)
 
-        draft = planner.revise_plan(
+        draft, rule_report = planner.revise_plan(
             self.config, anchors, as_of,
             version=(current.version + 1) if current else 1,
             constraints=constraints, rationale=rationale,
@@ -234,11 +254,30 @@ class CoachService:
                 "valid": not any(i.severity == "error" for i in issues),
                 "issues": [i.to_dict() for i in issues],
             },
+            # Whether the milestone-shape rules held, and what the repair
+            # loop had to do. A draft the loop couldn't fully repair must
+            # be shown with its violations, not presented as clean.
+            "rules": rule_report.to_dict(),
             "next_step": (
                 "This is a DRAFT and has not been saved. Show the athlete what changed and ask "
                 "explicitly whether to make it official. Only call publish_draft_plan after they say yes."
             ),
         }
+
+    def propose_pacing_change(self, message: str, rationale: Optional[str] = None,
+                               as_of: Optional[date] = None) -> Optional[dict]:
+        """Resolve a pacing phrase ("ramp up slower") into a draft revision.
+
+        Returns None when the message carries no recognisable pacing
+        intent, so the caller asks rather than guessing at a number.
+        """
+        intent = pacing_intent.interpret_pacing_request(message)
+        if intent is None:
+            return None
+        payload = self.propose_plan_revision(
+            intent.constraints, rationale or intent.explanation, as_of=as_of)
+        payload["pacing_intent"] = intent.to_dict()
+        return payload
 
     def publish_draft_plan(self, approval_note: str = "") -> dict:
         """Promote the held draft to the official plan, recording the
@@ -391,14 +430,99 @@ class CoachService:
         capable_week = None
         if milestone:
             capable_week = next((w.to_dict() for w in plan.weeks if w.long_run_mi >= milestone.distance_mi), None)
+        stages.annotate_stages(plan.weeks, self.config.guardrails.backoff_cadence)
         return {
             "plan_version": plan.version,
             "trigger": plan.trigger,
             "rationale": plan.rationale,
             "weeks": [w.to_dict() for w in plan.weeks],
+            # Phase breakdown computed here, not in the browser: the UI and
+            # the coach must describe the plan's shape identically.
+            "stages": stages.stage_summary(plan.weeks),
             "half_marathon_capability_week": capable_week,
             "validation": self.get_plan_validation(),
         }
+
+    # --- scoped plan views ----------------------------------------------------
+
+    def get_plan_range_payload(
+        self,
+        weeks_ahead: Optional[int] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+        from_milestone: Optional[str] = None,
+        to_milestone: Optional[str] = None,
+        as_of: Optional[date] = None,
+    ) -> dict:
+        """Every week in a requested slice of the plan — no truncation.
+
+        The coach used to answer "show me the plan" with a summary, which
+        is the wrong trade: if a slice is too big to show, the fix is to
+        agree a smaller slice with the athlete, not to silently drop weeks.
+        So this returns the complete range and reports `week_count` so the
+        caller can see nothing was elided.
+
+        Ranges can be expressed the way people actually ask for them:
+        "the next 4 weeks" (`weeks_ahead`), a date window, or "between my
+        half marathon and my marathon" (`from_milestone`/`to_milestone`).
+        """
+        plan = self.get_plan()
+        if plan is None:
+            return {"error": "No plan exists yet. Run `usain-bot init` first."}
+        as_of = as_of or date.today()
+        weeks = list(plan.weeks)
+        stages.annotate_stages(weeks, self.config.guardrails.backoff_cadence)
+        scope_parts: list[str] = []
+
+        def milestone_week(name: str) -> Optional[PlanWeek]:
+            milestone = ms.milestone_by_name(self.config, name)
+            kind = milestone.kind if milestone else name
+            return next((w for w in weeks if w.block == kind), None)
+
+        start = end = None
+        if from_milestone:
+            week = milestone_week(from_milestone)
+            if week is None:
+                return {"error": f"No week in the plan corresponds to milestone '{from_milestone}'."}
+            start = week.start_date
+            scope_parts.append(f"from {from_milestone.replace('_', ' ')}")
+        if to_milestone:
+            week = milestone_week(to_milestone)
+            if week is None:
+                return {"error": f"No week in the plan corresponds to milestone '{to_milestone}'."}
+            end = week.start_date
+            scope_parts.append(f"to {to_milestone.replace('_', ' ')}")
+        if from_date:
+            start = from_date
+            scope_parts.append(f"from {from_date.isoformat()}")
+        if to_date:
+            end = to_date
+            scope_parts.append(f"to {to_date.isoformat()}")
+
+        if weeks_ahead is not None:
+            start = start or as_of - timedelta(days=as_of.weekday())
+            end = start + timedelta(weeks=max(1, weeks_ahead) - 1)
+            scope_parts = [f"the next {weeks_ahead} week(s)"]
+
+        if start is None and end is None:
+            scope_parts = ["the whole plan"]
+
+        selected = [
+            w for w in weeks
+            if (start is None or w.start_date >= start) and (end is None or w.start_date <= end)
+        ]
+        return {
+            "plan_version": plan.version,
+            "scope": " ".join(scope_parts),
+            "week_count": len(selected),
+            "total_plan_weeks": len(weeks),
+            "truncated": False,     # this view never truncates, by design
+            "weeks": [w.to_dict() for w in selected],
+            "stages": stages.stage_summary(selected),
+        }
+
+    def get_milestones_payload(self, as_of: Optional[date] = None) -> dict:
+        return ms.milestones_payload(self.config, as_of or date.today())
 
     def get_plan_history(self) -> list[PlanVersion]:
         return self.storage.get_plan_history()

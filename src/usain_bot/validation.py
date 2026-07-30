@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 from . import guardrails as gr
+from . import stages
 from .models import PlanWeek
 
 HM_PREREQ_LONG_RUN_MI = 12.0
@@ -90,6 +91,20 @@ def _check_race(
     return race_index
 
 
+def _contiguous_build_blocks(weeks: list[PlanWeek]) -> list[list[PlanWeek]]:
+    """Build weeks grouped into runs of the same block, so each training
+    block is judged against its own peak rather than the plan's."""
+    groups: list[list[PlanWeek]] = []
+    for w in weeks:
+        if w.block not in _BUILD_BLOCKS:
+            continue
+        if groups and groups[-1][-1].block == w.block and w.week_number == groups[-1][-1].week_number + 1:
+            groups[-1].append(w)
+        else:
+            groups.append([w])
+    return groups
+
+
 def validate_plan(weeks: list[PlanWeek], marathon_date: date) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     if not weeks:
@@ -141,12 +156,24 @@ def validate_plan(weeks: list[PlanWeek], marathon_date: date) -> list[Validation
             ))
 
     # --- gradual build ---------------------------------------------------------
+    # The increment guardrail governs *progression* — going further than
+    # you have gone before. Inside the maintain stage the long run
+    # oscillates by design, and a rebound toward a distance already run in
+    # that stage is a return to demonstrated capability, not a new load. So
+    # the check applies to anything above the stage's established peak, and
+    # skips the rebounds below it.
+    demonstrated_peak = 0.0
     for prev, cur in zip(weeks, weeks[1:]):
+        demonstrated_peak = max(demonstrated_peak, prev.long_run_mi)
         if cur.week_number != prev.week_number + 1:
             continue
         if prev.block not in _BUILD_BLOCKS or cur.block not in _BUILD_BLOCKS:
             continue
         if prev.is_backoff or cur.is_backoff:
+            continue
+        maintaining = (prev.stage == stages.TrainingStage.MAINTAIN_MILEAGE.value
+                       and cur.stage == stages.TrainingStage.MAINTAIN_MILEAGE.value)
+        if maintaining and cur.long_run_mi <= demonstrated_peak + _LR_INCREMENT_TOLERANCE_MI:
             continue
         max_lr_step = gr.long_run_increment(prev.long_run_mi) + _LR_INCREMENT_TOLERANCE_MI
         if cur.long_run_mi - prev.long_run_mi > max_lr_step:
@@ -180,6 +207,31 @@ def validate_plan(weeks: list[PlanWeek], marathon_date: date) -> list[Validation
                 consecutive_builds = 0
         else:
             consecutive_builds = 0
+
+    # --- peak long runs are never back-to-back ---------------------------------
+    # The single most load-bearing rule of the maintain stage: a max-mileage
+    # week must be followed by a back-off (or the taper). Two 22-milers in a
+    # row is the pattern that breaks people, and it is an error rather than
+    # a warning because no amount of context makes it acceptable.
+    # Checked per contiguous build block: the ultra block peaks lower than
+    # the marathon block, and two peak weeks in a row there is just as bad
+    # even though the number is smaller. A single plan-wide peak would let
+    # the smaller block's plateau through.
+    for block_weeks in _contiguous_build_blocks(weeks):
+        block_peak = max(w.long_run_mi for w in block_weeks)
+        if block_peak <= 0:
+            continue
+        for prev, cur in zip(block_weeks, block_weeks[1:]):
+            if cur.week_number != prev.week_number + 1:
+                continue
+            if stages.is_repeated_peak(prev.long_run_mi, cur.long_run_mi, block_peak,
+                                        _LR_INCREMENT_TOLERANCE_MI):
+                issues.append(ValidationIssue(
+                    "error", "back_to_back_peak",
+                    f"Weeks {prev.week_number} and {cur.week_number} both run the peak long run "
+                    f"({prev.long_run_mi:.1f} / {cur.long_run_mi:.1f} mi). A max-mileage week must be "
+                    "followed by a back-off or the taper.",
+                ))
 
     # --- long-run share (informational) ----------------------------------------
     high_share_weeks = [

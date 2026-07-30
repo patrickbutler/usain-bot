@@ -63,6 +63,11 @@ class PublishDraftRequest(BaseModel):
     approval_note: str = ""
 
 
+class PacingRequest(BaseModel):
+    message: str
+    rationale: Optional[str] = None
+
+
 class SettingsRequest(BaseModel):
     jamaican_mode: Optional[bool] = None
 
@@ -101,6 +106,33 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
     @app.get("/api/plan")
     def get_plan():
         return service.get_plan_payload()
+
+    @app.get("/api/plan/range")
+    def get_plan_range(
+        weeks_ahead: Optional[int] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        from_milestone: Optional[str] = None,
+        to_milestone: Optional[str] = None,
+    ):
+        """A slice of the plan, complete — this view never truncates."""
+        try:
+            result = service.get_plan_range_payload(
+                weeks_ahead=weeks_ahead,
+                from_date=date.fromisoformat(from_date) if from_date else None,
+                to_date=date.fromisoformat(to_date) if to_date else None,
+                from_milestone=from_milestone, to_milestone=to_milestone,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid date: {exc}") from exc
+        if "error" in result:
+            raise HTTPException(404, result["error"])
+        return result
+
+    @app.get("/api/milestones")
+    def get_milestones():
+        """Upcoming milestones and whether each has a set date."""
+        return service.get_milestones_payload()
 
     @app.get("/api/plan/history")
     def get_plan_history():
@@ -175,6 +207,18 @@ def create_app(config: Config, storage: StorageBackend, adapter: GarminAdapter) 
             ultra_delay_weeks=req.ultra_delay_weeks, run_days_per_week=req.run_days_per_week,
         )
         return service.propose_plan_revision(constraints, req.rationale)
+
+    @app.post("/api/plan/revision/pacing")
+    def propose_pacing_change(req: PacingRequest):
+        """Resolve a pacing phrase ("ramp up slower") into a draft revision.
+        Returns 422 when the phrase carries no recognisable intent — better
+        to ask the athlete than to guess at a number."""
+        result = service.propose_pacing_change(req.message, req.rationale)
+        if result is None:
+            raise HTTPException(
+                422, "No pacing intent recognised in that message — ask the athlete what they want "
+                     "changed, or use /api/plan/revision/propose with explicit constraints.")
+        return result
 
     @app.post("/api/plan/revision/publish")
     def publish_plan_revision(req: PublishDraftRequest):
